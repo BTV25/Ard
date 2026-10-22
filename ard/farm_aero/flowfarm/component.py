@@ -455,6 +455,11 @@ class FLOWFarmBatchPower(templates.BatchFarmPowerTemplate, FLOWFarmComponent):
         self.declare_partials("power_farm", "x_turbines", method="exact")
         self.declare_partials("power_farm", "y_turbines", method="exact")
         self.declare_partials("power_farm", "yaw_turbines", method="exact")
+        # AEP_farm = sum(state_powers) is also an output; undeclared, its partials
+        # would be treated as zero (silently zero d AEP_farm / d layout).
+        self.declare_partials("AEP_farm", "x_turbines", method="exact")
+        self.declare_partials("AEP_farm", "y_turbines", method="exact")
+        self.declare_partials("AEP_farm", "yaw_turbines", method="exact")
         # yaw_turbines is in degrees; use a 0.01° step (not position-scale meters)
         self.set_check_partial_options("yaw_turbines", method="fd", step=0.01)
         # x/y_turbines are in meters, spanning O(1e3). A large default FD step
@@ -517,4 +522,12 @@ class FLOWFarmBatchPower(templates.BatchFarmPowerTemplate, FLOWFarmComponent):
         # Julia gradient is d/d(yaw_rad); yaw_turbines input is in degrees → chain rule factor
         partials["power_farm", "yaw_turbines"] = (
             state_gradients[:, 2 * self.N_turbines : 3 * self.N_turbines] * np.deg2rad(1.0)
+        )
+        # AEP_farm = sum_i state_powers[i] (Wh/year), so its gradient is the column
+        # sum of the unscaled state_gradients.
+        aep_grad = np.asarray(self.sparse_struct.state_gradients).sum(axis=0)
+        partials["AEP_farm", "x_turbines"] = aep_grad[: self.N_turbines]
+        partials["AEP_farm", "y_turbines"] = aep_grad[self.N_turbines : 2 * self.N_turbines]
+        partials["AEP_farm", "yaw_turbines"] = (
+            aep_grad[2 * self.N_turbines : 3 * self.N_turbines] * np.deg2rad(1.0)
         )
