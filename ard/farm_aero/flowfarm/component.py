@@ -10,8 +10,35 @@ from .flowfarm_model import (
 
 from .. import templates
 
+_PRIMAL_HELPER_DEFINED = False
+
+# Primal per-state turbine powers (W), threaded over states; same calls as
+# FLOWFarm.calculate_state_aep, which is sum(powers) * hours_per_year * prob.
+_PRIMAL_HELPER = """
+function ard_state_turbine_powers(FF, farm)
+    c = farm.constants
+    wr = c.wind_resource
+    nstates = length(wr.wind_probabilities)
+    out = zeros(nstates, length(farm.turbine_x))
+    Threads.@threads for i = 1:nstates
+        rot_x, rot_y = FF.rotate_to_wind_direction(farm.turbine_x, farm.turbine_y, wr.wind_directions[i])
+        sorted_turbine_index = sortperm(rot_x)
+        v = FF.turbine_velocities_one_direction_vel(rot_x, rot_y, c.turbine_z, farm.rotor_diameter,
+                farm.hub_height, farm.turbine_yaw, sorted_turbine_index, c.ct_models,
+                c.rotor_sample_points_y, c.rotor_sample_points_z, wr, c.model_set; wind_farm_state_id=i)
+        out[i, :] = FF.turbine_powers_one_direction(c.generator_efficiency, c.cut_in_speed,
+                c.cut_out_speed, c.rated_speed, c.rated_power, farm.rotor_diameter, v,
+                farm.turbine_yaw, wr.air_density, c.power_models)
+    end
+    return out
+end
+"""
+
 
 class FLOWFarmComponent:
+
+    opt_yaw = True
+    sparse_struct = None
 
     def initialize(self):
         # This mixin is invoked explicitly by derived classes; no super() chain here.
@@ -21,7 +48,12 @@ class FLOWFarmComponent:
         return float(wind_resource.get("air_density", 1.225))
 
     def _get_wake_model_options(self, model_options):
-        return resolve_wake_model_inputs_for_flowfarm(model_options.get("flowfarm", {}))
+        opts = dict(model_options.get("flowfarm", {}) or {})
+        # opt_yaw: False drops the yaw columns from the sparse Jacobian (fewer colors);
+        # yaw partials are not declared and the gradient requires yaw_turbines == 0
+        # (the forward pass still honors yaw).
+        self.opt_yaw = bool(opts.pop("opt_yaw", True))
+        return resolve_wake_model_inputs_for_flowfarm(opts)
 
     def _build_wind_resource(
         self,
@@ -94,7 +126,7 @@ class FLOWFarmComponent:
                     @inbounds for i in 1:n
                         farm.turbine_x[i] = x[i]
                         farm.turbine_y[i] = x[n + i]
-                        farm.turbine_yaw[i] = x[2n + i]
+                        length(x) >= 3n && (farm.turbine_yaw[i] = x[2n + i])
                     end
                     return nothing
                 end
@@ -146,8 +178,12 @@ class FLOWFarmComponent:
         rated_powers = jl.fill(float(rated_power), N_turbines)
         update_fn = self._create_update_fn(jl)
 
-        sparse_farm, sparse_struct = flowfarm_module.build_unstable_sparse_struct(
-            x0,
+        # x is [x; y] (2N) when yaw is not optimized; update_fn then leaves yaw at 0.
+        x0_sparse = x0 if self.opt_yaw else to_julia_vector_float64(jl, x0_np[: 2 * N_turbines])
+
+        # Built lazily on the first gradient request: primal-only runs never pay it.
+        self._build_sparse = lambda: flowfarm_module.build_unstable_sparse_struct(
+            x0_sparse,
             turbine_x,
             turbine_y,
             turbine_z,
@@ -167,7 +203,7 @@ class FLOWFarmComponent:
             AEP_scale=1,
             opt_x=True,
             opt_y=True,
-            opt_yaw=True,
+            opt_yaw=self.opt_yaw,
             tolerance=tolerance,
         )
 
@@ -192,7 +228,7 @@ class FLOWFarmComponent:
             AEP_scale=1,
         )
 
-        return x0, farm, sparse_farm, sparse_struct
+        return x0, farm, None, None
 
     def _initial_turbine_positions(self, model_options, rotor_diameter):
         """Compute a non-degenerate calibration layout for sparsity detection.
@@ -356,6 +392,12 @@ class FLOWFarmComponent:
         yaw_turbines = np.deg2rad(np.asarray(inputs["yaw_turbines"], dtype=float))
         return np.concatenate([x_turbines, y_turbines, yaw_turbines]).ravel()
 
+    def _check_yaw(self, x_eval_np):
+        if not self.opt_yaw and np.any(x_eval_np[2 * self.N_turbines :] != 0.0):
+            raise ValueError(
+                "FLOWFarm opt_yaw is False but yaw_turbines is nonzero; set opt_yaw: true."
+            )
+
     def _evaluate_sparse(self, x_eval_np):
         """Run sparse gradient evaluation once and cache AEP/gradient for reuse."""
         if hasattr(self, "_cached_sparse_x") and np.array_equal(
@@ -367,7 +409,11 @@ class FLOWFarmComponent:
         if jl is None:
             jl = ensure_flowfarm_loaded()
             self._jl = jl
-        x_eval = to_julia_vector_float64(jl, x_eval_np)
+        if self.sparse_struct is None:
+            self.sparse_farm, self.sparse_struct = self._build_sparse()
+        self._check_yaw(x_eval_np)
+        x_sparse = x_eval_np if self.opt_yaw else x_eval_np[: 2 * self.N_turbines]
+        x_eval = to_julia_vector_float64(jl, x_sparse)
         calculate_grad_bang = getattr(self.flowfarm_module, "calculate_aep_gradient!")
         aep_val, grad_val = calculate_grad_bang(
             self.sparse_farm,
@@ -410,10 +456,11 @@ class FLOWFarmComponent:
         grad = self._cached_sparse_grad
         partials["AEP_farm", "x_turbines"] = grad[: self.N_turbines]
         partials["AEP_farm", "y_turbines"] = grad[self.N_turbines : 2 * self.N_turbines]
-        # Julia gradient is d/d(yaw_rad); yaw_turbines input is in degrees → chain rule factor
-        partials["AEP_farm", "yaw_turbines"] = (
-            grad[2 * self.N_turbines : 3 * self.N_turbines] * np.deg2rad(1.0)
-        )
+        if self.opt_yaw:
+            # Julia gradient is d/d(yaw_rad); yaw_turbines input is in degrees → chain rule factor
+            partials["AEP_farm", "yaw_turbines"] = (
+                grad[2 * self.N_turbines : 3 * self.N_turbines] * np.deg2rad(1.0)
+            )
 
 
 class FLOWFarmAEP(templates.FarmAEPTemplate, FLOWFarmComponent):
@@ -429,9 +476,10 @@ class FLOWFarmAEP(templates.FarmAEPTemplate, FLOWFarmComponent):
     def setup_partials(self):
         self.declare_partials("AEP_farm", "x_turbines", method="exact")
         self.declare_partials("AEP_farm", "y_turbines", method="exact")
-        self.declare_partials("AEP_farm", "yaw_turbines", method="exact")
-        # yaw_turbines is in degrees; use a 0.01° step (not position-scale meters)
-        self.set_check_partial_options("yaw_turbines", method="fd", step=0.01)
+        if self.opt_yaw:
+            self.declare_partials("AEP_farm", "yaw_turbines", method="exact")
+            # yaw_turbines is in degrees; use a 0.01° step (not position-scale meters)
+            self.set_check_partial_options("yaw_turbines", method="fd", step=0.01)
 
     def compute(self, inputs, outputs):
         FLOWFarmComponent._compute_aep(self, inputs, outputs)
@@ -454,14 +502,15 @@ class FLOWFarmBatchPower(templates.BatchFarmPowerTemplate, FLOWFarmComponent):
         # State power sensitivities are provided via sparse_struct.state_gradients.
         self.declare_partials("power_farm", "x_turbines", method="exact")
         self.declare_partials("power_farm", "y_turbines", method="exact")
-        self.declare_partials("power_farm", "yaw_turbines", method="exact")
         # AEP_farm = sum(state_powers) is also an output; undeclared, its partials
         # would be treated as zero (silently zero d AEP_farm / d layout).
         self.declare_partials("AEP_farm", "x_turbines", method="exact")
         self.declare_partials("AEP_farm", "y_turbines", method="exact")
-        self.declare_partials("AEP_farm", "yaw_turbines", method="exact")
-        # yaw_turbines is in degrees; use a 0.01° step (not position-scale meters)
-        self.set_check_partial_options("yaw_turbines", method="fd", step=0.01)
+        if self.opt_yaw:
+            self.declare_partials("power_farm", "yaw_turbines", method="exact")
+            self.declare_partials("AEP_farm", "yaw_turbines", method="exact")
+            # yaw_turbines is in degrees; use a 0.01° step (not position-scale meters)
+            self.set_check_partial_options("yaw_turbines", method="fd", step=0.01)
         # x/y_turbines are in meters, spanning O(1e3). A large default FD step
         # (e.g. 1-10 m) can push a downwind turbine's effective wind speed
         # across a power-curve kink (cut-in, rated speed, cut-out), producing
@@ -487,12 +536,29 @@ class FLOWFarmBatchPower(templates.BatchFarmPowerTemplate, FLOWFarmComponent):
         ).ravel()
         return hours_per_year * wind_probs  # shape (n_states,)
 
-    def compute(self, inputs, outputs):
-        x_eval_np = self._build_design_vector(inputs)
-        self._evaluate_sparse(x_eval_np)
+    def _primal_turbine_powers(self, x_eval_np):
+        """Per-state turbine powers in W, shape (n_states, N); no derivatives."""
+        global _PRIMAL_HELPER_DEFINED
+        jl = self._jl
+        if not _PRIMAL_HELPER_DEFINED:
+            jl.seval(_PRIMAL_HELPER)
+            _PRIMAL_HELPER_DEFINED = True
+        self.farm.update_function(self.farm, to_julia_vector_float64(jl, x_eval_np))
+        return np.asarray(jl.ard_state_turbine_powers(self.flowfarm_module, self.farm))
 
-        state_powers_scaled = np.asarray(self.sparse_struct.state_powers).ravel()
+    def compute(self, inputs, outputs):
+        # Forward pass only; the sparse gradient runs in compute_partials. Reuse it if
+        # it was already evaluated at this x.
+        x_eval_np = self._build_design_vector(inputs)
         scale = self._get_state_scale()
+        if hasattr(self, "_cached_sparse_x") and np.array_equal(
+            self._cached_sparse_x, x_eval_np
+        ):
+            state_powers_scaled = np.asarray(self.sparse_struct.state_powers).ravel()
+            turbine_powers = np.asarray(self.sparse_struct.turbine_powers) / scale[np.newaxis, :]
+        else:
+            turbine_powers = self._primal_turbine_powers(x_eval_np).T  # (N, n_states), W
+            state_powers_scaled = turbine_powers.sum(axis=0) * scale
 
         outputs["power_farm"] = state_powers_scaled / scale
         outputs["AEP_farm"] = float(state_powers_scaled.sum())  # Wh/year
@@ -501,8 +567,7 @@ class FLOWFarmBatchPower(templates.BatchFarmPowerTemplate, FLOWFarmComponent):
             .get("aero", {})
             .get("return_turbine_output")
         ):
-            turbine_powers_scaled = np.asarray(self.sparse_struct.turbine_powers)
-            outputs["power_turbines"] = turbine_powers_scaled / scale[np.newaxis, :]
+            outputs["power_turbines"] = turbine_powers
             outputs["thrust_turbines"] = np.zeros(
                 (self.N_turbines, self.N_wind_conditions)
             )
@@ -519,15 +584,17 @@ class FLOWFarmBatchPower(templates.BatchFarmPowerTemplate, FLOWFarmComponent):
         partials["power_farm", "y_turbines"] = state_gradients[
             :, self.N_turbines : 2 * self.N_turbines
         ]
-        # Julia gradient is d/d(yaw_rad); yaw_turbines input is in degrees → chain rule factor
-        partials["power_farm", "yaw_turbines"] = (
-            state_gradients[:, 2 * self.N_turbines : 3 * self.N_turbines] * np.deg2rad(1.0)
-        )
+        if self.opt_yaw:
+            # Julia gradient is d/d(yaw_rad); yaw_turbines input is in degrees → chain rule factor
+            partials["power_farm", "yaw_turbines"] = (
+                state_gradients[:, 2 * self.N_turbines : 3 * self.N_turbines] * np.deg2rad(1.0)
+            )
         # AEP_farm = sum_i state_powers[i] (Wh/year), so its gradient is the column
         # sum of the unscaled state_gradients.
         aep_grad = np.asarray(self.sparse_struct.state_gradients).sum(axis=0)
         partials["AEP_farm", "x_turbines"] = aep_grad[: self.N_turbines]
         partials["AEP_farm", "y_turbines"] = aep_grad[self.N_turbines : 2 * self.N_turbines]
-        partials["AEP_farm", "yaw_turbines"] = (
-            aep_grad[2 * self.N_turbines : 3 * self.N_turbines] * np.deg2rad(1.0)
-        )
+        if self.opt_yaw:
+            partials["AEP_farm", "yaw_turbines"] = (
+                aep_grad[2 * self.N_turbines : 3 * self.N_turbines] * np.deg2rad(1.0)
+            )

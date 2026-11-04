@@ -33,7 +33,10 @@ class TestBuildDesignVector:
             "yaw_turbines": np.array([5.0, -5.0, 0.0]),
         }
         result = comp._build_design_vector(inputs)
-        expected = np.array([100.0, 200.0, 300.0, 0.0, 50.0, 100.0, 5.0, -5.0, 0.0])
+        # yaw is converted from degrees to radians for FLOWFarm
+        expected = np.array(
+            [100.0, 200.0, 300.0, 0.0, 50.0, 100.0, *np.deg2rad([5.0, -5.0, 0.0])]
+        )
         assert np.allclose(result, expected)
 
     def test_returns_flat_array(self):
@@ -192,7 +195,10 @@ class TestComputeAEPPartials:
 
         assert np.allclose(partials["AEP_farm", "x_turbines"], grad[:n])
         assert np.allclose(partials["AEP_farm", "y_turbines"], grad[n : 2 * n])
-        assert np.allclose(partials["AEP_farm", "yaw_turbines"], grad[2 * n : 3 * n])
+        # Julia gradient is per radian; yaw_turbines is in degrees
+        assert np.allclose(
+            partials["AEP_farm", "yaw_turbines"], grad[2 * n : 3 * n] * np.deg2rad(1.0)
+        )
 
 
 # ---------------------------------------------------------------------------
