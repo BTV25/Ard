@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 
 from ..floris import create_FLORIS_turbine_from_windIO
@@ -360,6 +362,16 @@ class FLOWFarmComponent:
         model_set = self._build_wake_model_set(flowfarm_module, wake_model_options)
 
         x_init, y_init = self._initial_turbine_positions(model_options, rotor_diameter)
+        # flowfarm.jacobian_method: "reverse" (default; per-state Enzyme reverse, _reverse.jl,
+        # BatchPower only; needs the flowfarm-enzyme FLOWFarm with positional entry points; other
+        # components fall back to chunked), "chunked" (color-seeded chunked ForwardDiff, _fastjac.jl) or "di"
+        # (FLOWFarm's DifferentiationInterface path). Discontinuous models (JensenTopHat,
+        # LocalTIModelMaxTI) give unreliable gradients with any method.
+        method = model_options.get("flowfarm", {}).get("jacobian_method", "reverse")
+        if method not in ("reverse", "chunked", "di"):
+            raise ValueError(f"flowfarm.jacobian_method must be 'reverse', 'chunked' or 'di', got {method!r}")
+        if method == "reverse" and not isinstance(self, FLOWFarmBatchPower):
+            method = "chunked"
         x0, farm, sparse_farm, sparse_struct = self._build_farm_structures(
             jl,
             flowfarm_module,
@@ -386,6 +398,25 @@ class FLOWFarmComponent:
         self.sparse_farm = sparse_farm
         self.sparse_struct = sparse_struct
 
+        self._fastjac_cache = None
+        if method == "reverse":
+            if not jl.seval("isdefined(Main, :ArdReverse)"):
+                jl.seval(Path(__file__).with_name("_reverse.jl").read_text())
+            n_states = len(np.asarray(farm.constants.wind_resource.wind_speeds).ravel())
+            self.sparse_farm = farm
+            # opt_yaw False (yaw not a design variable, must stay 0): skips the yaw adjoint and
+            # the (identically zero) yaw deflection; yaw columns of state_gradients are then 0.
+            self.sparse_struct = jl.ArdReverse.ReverseState(
+                farm, n_states, self.N_turbines, 3 * self.N_turbines, opt_yaw=self.opt_yaw
+            )
+            self._reverse = True
+        elif method == "chunked":
+            if not jl.seval("isdefined(Main, :ArdFastJac)"):
+                jl.seval(Path(__file__).with_name("_fastjac.jl").read_text())
+            # sparse struct is built lazily; take the state count from the wind resource
+            n_states = len(np.asarray(farm.constants.wind_resource.wind_speeds).ravel())
+            self._fastjac_cache = jl.ArdFastJac.FastCache(n_states)
+
     def _build_design_vector(self, inputs):
         x_turbines = np.asarray(inputs["x_turbines"], dtype=float)
         y_turbines = np.asarray(inputs["y_turbines"], dtype=float)
@@ -409,17 +440,28 @@ class FLOWFarmComponent:
         if jl is None:
             jl = ensure_flowfarm_loaded()
             self._jl = jl
-        if self.sparse_struct is None:
-            self.sparse_farm, self.sparse_struct = self._build_sparse()
         self._check_yaw(x_eval_np)
-        x_sparse = x_eval_np if self.opt_yaw else x_eval_np[: 2 * self.N_turbines]
-        x_eval = to_julia_vector_float64(jl, x_sparse)
-        calculate_grad_bang = getattr(self.flowfarm_module, "calculate_aep_gradient!")
-        aep_val, grad_val = calculate_grad_bang(
-            self.sparse_farm,
-            x_eval,
-            self.sparse_struct,
-        )
+        if getattr(self, "_reverse", False):
+            # ReverseState takes the full [x; y; yaw] vector (yaw columns 0 when opt_yaw is False).
+            aep_val, grad_val = getattr(jl.ArdReverse, "gradient!")(
+                self.sparse_farm, to_julia_vector_float64(jl, x_eval_np), self.sparse_struct
+            )
+        else:
+            if self.sparse_struct is None:
+                self.sparse_farm, self.sparse_struct = self._build_sparse()
+            x_sparse = x_eval_np if self.opt_yaw else x_eval_np[: 2 * self.N_turbines]
+            x_eval = to_julia_vector_float64(jl, x_sparse)
+            if getattr(self, "_fastjac_cache", None) is not None:
+                aep_val, grad_val = getattr(jl.ArdFastJac, "gradient!")(
+                    self.sparse_farm, x_eval, self.sparse_struct, self._fastjac_cache
+                )
+            else:
+                calculate_grad_bang = getattr(self.flowfarm_module, "calculate_aep_gradient!")
+                aep_val, grad_val = calculate_grad_bang(
+                    self.sparse_farm,
+                    x_eval,
+                    self.sparse_struct,
+                )
 
         self._cached_sparse_x = x_eval_np.copy()
         self._cached_sparse_aep = float(np.asarray(aep_val).ravel()[0])
