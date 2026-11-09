@@ -1,9 +1,11 @@
 # Chunked ForwardDiff gradients of the farm power, two variants:
 #  * DenseState / dense_gradient!: dense chunked ForwardDiff (every design variable seeded,
-#    no sparsity pattern, no pruning; exact to roundoff). Default forward fallback.
-#  * FastCache / gradient!: color-seeded chunked Jacobian on FLOWFarm's unstable-pattern sparse
-#    path ("chunked_sparse"). Replaces the DifferentiationInterface jacobian! call; the primal
-#    evaluation, sparsity pattern detection and recoloring triggers are still FLOWFarm's own.
+#    no sparsity pattern, no pruning; exact to roundoff). `chunked_dense`, and `chunked` below
+#    auto_dense_below.
+#  * FastCache / gradient!: color-seeded sparse chunked Jacobian on FLOWFarm's unstable-pattern
+#    sparse path (`chunked_sparse`, and `chunked` above the threshold). Replaces the
+#    DifferentiationInterface jacobian! call; the primal evaluation, sparsity pattern detection
+#    and recoloring triggers are still FLOWFarm's own.
 module ArdFastJac
 
 const FF = Main.FLOWFarm
@@ -205,7 +207,7 @@ function dense_gradient!(farm, x, ds::DenseState)
     return sum(ds.state_powers), vec(sum(ds.state_gradients; dims = 1))
 end
 
-# ---- union of sparsity cutoffs over several layouts ("chunked_auto") --------------------------
+# ---- union of sparsity cutoffs over several layouts ("chunked", alias chunked_auto) --------------------------
 # FLOWFarm keeps one deficit cutoff per wind state (0.1 x the smallest deficit that still has a
 # nonzero derivative at the calibration layout); a pair is kept when its deficit >= cutoff. The
 # union of the patterns of several layouts is the pattern of the smallest cutoff over them.

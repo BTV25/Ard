@@ -37,10 +37,22 @@ end
 """
 
 
+# modeling_options.flowfarm keys consumed by Ard itself (not passed to FLOWFarm's wake model resolution)
+_ARD_OPTIONS = (
+    "jacobian_method",
+    "auto_dense_below",
+    "union_snapshots",
+    "union_seed",
+    "min_spacing_D",
+)
+
+
 class FLOWFarmComponent:
 
     opt_yaw = True
     sparse_struct = None
+    # Test hook only (not a user option): scales the chunked-auto sparsity cutoffs to force the dense fallback.
+    _test_threshold_scale = 1.0
 
     def initialize(self):
         # This mixin is invoked explicitly by derived classes; no super() chain here.
@@ -55,6 +67,9 @@ class FLOWFarmComponent:
         # yaw partials are not declared and the gradient requires yaw_turbines == 0
         # (the forward pass still honors yaw).
         self.opt_yaw = bool(opts.pop("opt_yaw", True))
+        # Ard-side options (not wake model inputs): read directly from model_options elsewhere.
+        for key in _ARD_OPTIONS:
+            opts.pop(key, None)
         return resolve_wake_model_inputs_for_flowfarm(opts)
 
     def _build_wind_resource(
@@ -179,6 +194,12 @@ class FLOWFarmComponent:
         rated_speeds = jl.fill(float(rated_wind_speed), N_turbines)
         rated_powers = jl.fill(float(rated_power), N_turbines)
         update_fn = self._create_update_fn(jl)
+        # positional arguments shared by every FLOWFarm farm-struct builder below (after x0)
+        common = (
+            turbine_x, turbine_y, turbine_z, hub_heights, turbine_yaw, rotor_diameters, ct_models,
+            generator_efficiencies, cut_in_speeds, cut_out_speeds, rated_speeds, rated_powers,
+            windresource, power_models, model_set, update_fn,
+        )
 
         # x is [x; y] (2N) when yaw is not optimized; update_fn then leaves yaw at 0.
         x0_sparse = x0 if self.opt_yaw else to_julia_vector_float64(jl, x0_np[: 2 * N_turbines])
@@ -186,22 +207,7 @@ class FLOWFarmComponent:
         # Built lazily on the first gradient request: primal-only runs never pay it.
         self._build_sparse = lambda: flowfarm_module.build_unstable_sparse_struct(
             x0_sparse,
-            turbine_x,
-            turbine_y,
-            turbine_z,
-            hub_heights,
-            turbine_yaw,
-            rotor_diameters,
-            ct_models,
-            generator_efficiencies,
-            cut_in_speeds,
-            cut_out_speeds,
-            rated_speeds,
-            rated_powers,
-            windresource,
-            power_models,
-            model_set,
-            update_fn,
+            *common,
             AEP_scale=1,
             opt_x=True,
             opt_y=True,
@@ -213,22 +219,7 @@ class FLOWFarmComponent:
         # ForwardDiffJacobian farm used by FLOWFarm to compute the sparsity cutoffs.
         self._build_fd_farm = lambda: flowfarm_module.build_wind_farm_struct(
             x0_sparse,
-            turbine_x,
-            turbine_y,
-            turbine_z,
-            hub_heights,
-            turbine_yaw,
-            rotor_diameters,
-            ct_models,
-            generator_efficiencies,
-            cut_in_speeds,
-            cut_out_speeds,
-            rated_speeds,
-            rated_powers,
-            windresource,
-            power_models,
-            model_set,
-            update_fn,
+            *common,
             AEP_scale=1,
             opt_x=True,
             opt_y=True,
@@ -241,22 +232,7 @@ class FLOWFarmComponent:
         # Dense chunked ForwardDiff farm: preallocations dual-typed with chunk width w.
         self._build_dense_farm = lambda w: flowfarm_module.build_wind_farm_struct(
             x0_sparse,
-            turbine_x,
-            turbine_y,
-            turbine_z,
-            hub_heights,
-            turbine_yaw,
-            rotor_diameters,
-            ct_models,
-            generator_efficiencies,
-            cut_in_speeds,
-            cut_out_speeds,
-            rated_speeds,
-            rated_powers,
-            windresource,
-            power_models,
-            model_set,
-            update_fn,
+            *common,
             AEP_scale=1,
             opt_x=True,
             opt_y=True,
@@ -266,26 +242,11 @@ class FLOWFarmComponent:
 
         farm = flowfarm_module.build_wind_farm_struct(
             x0,
-            turbine_x,
-            turbine_y,
-            turbine_z,
-            hub_heights,
-            turbine_yaw,
-            rotor_diameters,
-            ct_models,
-            generator_efficiencies,
-            cut_in_speeds,
-            cut_out_speeds,
-            rated_speeds,
-            rated_powers,
-            windresource,
-            power_models,
-            model_set,
-            update_fn,
+            *common,
             AEP_scale=1,
         )
 
-        return x0, farm, None, None
+        return x0, farm
 
     def _initial_turbine_positions(self, model_options, rotor_diameter):
         """Compute a non-degenerate calibration layout for sparsity detection.
@@ -433,7 +394,6 @@ class FLOWFarmComponent:
                 f"'chunked_dense', 'chunked_sparse' or 'di', got {method!r}"
             )
         ff_options = model_options.get("flowfarm", {})
-        self._auto = False
         if method in ("chunked", "chunked_auto"):
             # dense for small farms; above the threshold a union-of-layouts sparse pattern that is
             # self-checked against the dense Jacobian at the first gradient (dense on failure)
@@ -441,9 +401,8 @@ class FLOWFarmComponent:
                 method = "chunked_dense"
             else:
                 method = "chunked_sparse"
-                self._auto = True
                 self._auto_pending = True
-        x0, farm, sparse_farm, sparse_struct = self._build_farm_structures(
+        x0, farm = self._build_farm_structures(
             jl,
             flowfarm_module,
             self.N_turbines,
@@ -466,8 +425,8 @@ class FLOWFarmComponent:
         self.flowfarm_module = flowfarm_module
         self.x0 = x0
         self.farm = farm
-        self.sparse_farm = sparse_farm
-        self.sparse_struct = sparse_struct
+        self.sparse_farm = None
+        self.sparse_struct = None
 
         self._fastjac_cache = None
         if method in ("chunked_dense", "chunked_sparse") and not jl.seval("isdefined(Main, :ArdFastJac)"):
@@ -564,9 +523,8 @@ class FLOWFarmComponent:
                 getattr(jl.ArdFastJac, "union_snapshot!")(
                     self.sparse_struct, farm_fd, to_julia_vector_float64(jl, design(lay)), self._tolerance
                 )
-        scale = float(opts.get("auto_threshold_scale", 1.0))  # debug/test hook: corrupt the cutoffs
-        if scale != 1.0:
-            getattr(jl.ArdFastJac, "scale_thresholds!")(self.sparse_struct, scale)
+        if self._test_threshold_scale != 1.0:
+            getattr(jl.ArdFastJac, "scale_thresholds!")(self.sparse_struct, float(self._test_threshold_scale))
         self.auto_info["density_union"] = float(jl.ArdFastJac.pair_density(self.sparse_struct, x0))
 
         n_states = len(np.asarray(self.farm.constants.wind_resource.wind_speeds).ravel())
@@ -676,6 +634,27 @@ class FLOWFarmComponent:
 
 
 class FLOWFarmAEP(templates.FarmAEPTemplate, FLOWFarmComponent):
+    """FLOWFarm farm AEP (Wh/yr); yaw_turbines in degrees.
+
+    Options (``modeling_options["flowfarm"]``; defaults in parentheses):
+
+    - ``jacobian_method`` ("reverse"): "reverse" (per-state Enzyme reverse; needs Julia 1.11+),
+      "chunked" (auto: dense chunked ForwardDiff below ``auto_dense_below`` turbines, else a
+      union-of-layouts sparse pattern self-checked against dense; alias "chunked_auto"),
+      "chunked_dense", "chunked_sparse" (opt-in; cutoffs fixed at the start layout) or "di"
+      (FLOWFarm's DifferentiationInterface sparse path).
+    - ``opt_yaw`` (True): False drops the yaw partials; ``yaw_turbines`` must then stay 0.
+    - ``auto_dense_below`` (25): turbine count below which "chunked" uses the dense path.
+    - ``union_snapshots`` (8): layouts used to build the union sparsity cutoffs ("chunked" above
+      the threshold; 0 disables the union).
+    - ``union_seed`` (0): RNG seed of those layouts.
+    - ``min_spacing_D`` (3.0): minimum turbine spacing (rotor diameters) of those layouts.
+    - ``tolerance`` (1e-16): FLOWFarm sparsity tolerance.
+    - wake model keys (deficit, deflection, turbulence, superposition, ...): see
+      ``flowfarm_model.resolve_wake_model_inputs_for_flowfarm``.
+
+    Partials of AEP_farm wrt x_turbines, y_turbines (m) and, if opt_yaw, yaw_turbines (deg).
+    """
 
     def initialize(self):
         templates.FarmAEPTemplate.initialize(self)
@@ -701,6 +680,27 @@ class FLOWFarmAEP(templates.FarmAEPTemplate, FLOWFarmComponent):
 
 
 class FLOWFarmBatchPower(templates.BatchFarmPowerTemplate, FLOWFarmComponent):
+    """FLOWFarm per-state farm power (W) and AEP_farm (Wh/yr); yaw_turbines in degrees.
+
+    Options (``modeling_options["flowfarm"]``; defaults in parentheses):
+
+    - ``jacobian_method`` ("reverse"): "reverse" (per-state Enzyme reverse; needs Julia 1.11+),
+      "chunked" (auto: dense chunked ForwardDiff below ``auto_dense_below`` turbines, else a
+      union-of-layouts sparse pattern self-checked against dense; alias "chunked_auto"),
+      "chunked_dense", "chunked_sparse" (opt-in; cutoffs fixed at the start layout) or "di"
+      (FLOWFarm's DifferentiationInterface sparse path).
+    - ``opt_yaw`` (True): False drops the yaw partials; ``yaw_turbines`` must then stay 0.
+    - ``auto_dense_below`` (25): turbine count below which "chunked" uses the dense path.
+    - ``union_snapshots`` (8): layouts used to build the union sparsity cutoffs ("chunked" above
+      the threshold; 0 disables the union).
+    - ``union_seed`` (0): RNG seed of those layouts.
+    - ``min_spacing_D`` (3.0): minimum turbine spacing (rotor diameters) of those layouts.
+    - ``tolerance`` (1e-16): FLOWFarm sparsity tolerance.
+    - wake model keys (deficit, deflection, turbulence, superposition, ...): see
+      ``flowfarm_model.resolve_wake_model_inputs_for_flowfarm``.
+
+    Partials of power_farm and AEP_farm wrt x_turbines, y_turbines (m) and, if opt_yaw, yaw_turbines (deg).
+    """
 
     def initialize(self):
         templates.BatchFarmPowerTemplate.initialize(self)

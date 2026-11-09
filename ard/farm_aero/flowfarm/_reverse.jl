@@ -62,8 +62,7 @@ function state_power!(power, x, yaw_fixed, scratch, case, state_id)
     FF.rotate_to_wind_direction!(scratch.rot_x, scratch.rot_y, (@view x[1:n]), (@view x[n+1:2n]),
         resource.wind_directions[state_id])
     sortperm!(scratch.sort_index, scratch.rot_x; alg=Base.Sort.InsertionSort)
-    # master FLOWFarm keyword API; yaw is one concrete SubArray type (a Union with case.turbine_yaw
-    # breaks Enzyme type analysis)
+    # yaw is one concrete SubArray type (a Union with case.turbine_yaw breaks Enzyme type analysis)
     FF.turbine_velocities_one_direction_vel(scratch.rot_x, scratch.rot_y, case.turbine_z, case.rotor_diameter,
         case.hub_height, yaw, scratch.sort_index, case.constants.ct_models,
         case.constants.rotor_sample_points_y, case.constants.rotor_sample_points_z, resource,

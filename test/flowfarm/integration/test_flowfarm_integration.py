@@ -303,13 +303,16 @@ class TestFLOWFarmAEPJacobianMethod:
             assert comp.auto_info["fallback"] is False
             assert comp.auto_info["density_union"] >= comp.auto_info["density_single"] - 1e-12
 
-    def test_chunked_auto_selfcheck_falls_back_on_bad_cutoff(self):
+    def test_chunked_auto_selfcheck_falls_back_on_bad_cutoff(self, monkeypatch):
+        from ard.farm_aero.flowfarm.component import FLOWFarmComponent
+
+        monkeypatch.setattr(FLOWFarmComponent, "_test_threshold_scale", 1e30)
         pr, _ = _aep_problem("reverse", wake="CumulativeCurl")
         with pytest.warns(RuntimeWarning, match="falling back to dense"):
             pa, comp = _aep_problem(
                 "chunked",
                 wake="CumulativeCurl",
-                extra={"auto_dense_below": 1, "auto_threshold_scale": 1e30},
+                extra={"auto_dense_below": 1},
             )
             ga = self._aep_grad(pa)
         assert comp._dense and comp.auto_info["fallback"] and comp.auto_info["selfcheck_bad_pairs"] > 0
@@ -323,6 +326,23 @@ class TestFLOWFarmAEPJacobianMethod:
     def test_default_is_reverse(self):
         _, comp = _aep_problem(None)
         assert comp._reverse is True
+
+    def test_ard_options_do_not_warn_as_unknown_wake_options(self):
+        import warnings
+
+        extra = {"auto_dense_below": 3, "union_snapshots": 2, "union_seed": 1, "min_spacing_D": 3.0}
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            _aep_problem("chunked_dense", extra=extra)
+        assert not [x for x in w if "unknown wake model options" in str(x.message)]
+
+    def test_di_matches_reverse(self):
+        # legacy DifferentiationInterface path (calculate_aep_gradient!) smoke test; its sparsity
+        # pattern is pruned at the start layout (~4% here), so only a loose agreement is expected
+        pr, _ = _aep_problem("reverse")
+        pd, _ = _aep_problem("di")
+        gr, gd = self._aep_grad(pr), self._aep_grad(pd)
+        assert np.isfinite(gd).all() and np.abs(gd - gr).max() <= 0.1 * np.abs(gr).max()
 
     def test_invalid_method_raises(self):
         with pytest.raises(ValueError, match="jacobian_method"):
