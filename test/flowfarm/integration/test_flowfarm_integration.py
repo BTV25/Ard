@@ -242,7 +242,7 @@ def _aep_problem(method=None, opt_yaw=True, wake=None, extra=None):
 @pytest.mark.julia
 class TestFLOWFarmAEPJacobianMethod:
 
-    @pytest.mark.parametrize("method,tol", [("reverse", 1e-5), ("chunked", 1e-5)])
+    @pytest.mark.parametrize("method,tol", [("reverse", 1e-5), ("chunked_dense", 1e-5)])
     @pytest.mark.parametrize("opt_yaw", [True, False])
     def test_gradient_matches_central_fd(self, method, tol, opt_yaw):
         # Reverse and dense chunked ForwardDiff are exact to FD noise (no pruning).
@@ -274,7 +274,7 @@ class TestFLOWFarmAEPJacobianMethod:
     def test_dense_chunked_matches_reverse(self):
         # Same layout, both methods: dense chunked must agree with reverse to roundoff.
         pr, _ = _aep_problem("reverse")
-        pc, comp = _aep_problem("chunked")
+        pc, comp = _aep_problem("chunked_dense")
         assert getattr(comp, "_dense", False)
         wrt = [f"aepFLOWFarm.{v}_turbines" for v in ("x", "y", "yaw")]
         tr = pr.compute_totals(of=["aepFLOWFarm.AEP_farm"], wrt=wrt)
@@ -289,11 +289,12 @@ class TestFLOWFarmAEPJacobianMethod:
         t = prob.compute_totals(of=["aepFLOWFarm.AEP_farm"], wrt=wrt)
         return np.concatenate([t["aepFLOWFarm.AEP_farm", w].ravel() for w in wrt])
 
+    @pytest.mark.parametrize("alias", ["chunked", "chunked_auto"])
     @pytest.mark.parametrize("wake", ["GaussYawVariableSpread", "CumulativeCurl"])
     @pytest.mark.parametrize("below", [25, 1])  # 25: dense (N=9 < 25); 1: union-sparse path
-    def test_chunked_auto_matches_reverse(self, wake, below):
+    def test_chunked_auto_matches_reverse(self, alias, wake, below):
         pr, _ = _aep_problem("reverse", wake=wake)
-        pa, comp = _aep_problem("chunked_auto", wake=wake, extra={"auto_dense_below": below})
+        pa, comp = _aep_problem(alias, wake=wake, extra={"auto_dense_below": below})
         ga = self._aep_grad(pa)
         gr = self._aep_grad(pr)
         assert np.abs(ga - gr).max() <= 1e-12 * np.abs(gr).max()
@@ -306,7 +307,7 @@ class TestFLOWFarmAEPJacobianMethod:
         pr, _ = _aep_problem("reverse", wake="CumulativeCurl")
         with pytest.warns(RuntimeWarning, match="falling back to dense"):
             pa, comp = _aep_problem(
-                "chunked_auto",
+                "chunked",
                 wake="CumulativeCurl",
                 extra={"auto_dense_below": 1, "auto_threshold_scale": 1e30},
             )

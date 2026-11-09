@@ -419,24 +419,26 @@ class FLOWFarmComponent:
         x_init, y_init = self._initial_turbine_positions(model_options, rotor_diameter)
         # flowfarm.jacobian_method: "reverse" (default; per-state Enzyme reverse, _reverse.jl,
         # FLOWFarmBatchPower and FLOWFarmAEP; the AEP component sums the per-state rows),
-        # "chunked" (dense chunked ForwardDiff, no sparsity pruning, _fastjac.jl; the forward
-        # fallback), "chunked_sparse" (opt-in: color-seeded chunked ForwardDiff on FLOWFarm's
+        # "chunked" (forward: dense below auto_dense_below turbines, else a union-of-layouts sparse
+        # pattern self-checked against dense with dense fallback; alias "chunked_auto"),
+        # "chunked_dense" (explicit dense chunked ForwardDiff, no sparsity pruning, _fastjac.jl),
+        # "chunked_sparse" (opt-in: color-seeded chunked ForwardDiff on FLOWFarm's
         # sparse pattern, whose cutoffs are set when the pattern is built and can be off) or
         # "di" (FLOWFarm's DifferentiationInterface sparse path). Discontinuous models
         # (JensenTopHat, LocalTIModelMaxTI) give unreliable gradients with any method.
         method = model_options.get("flowfarm", {}).get("jacobian_method", "reverse")
-        if method not in ("reverse", "chunked", "chunked_sparse", "chunked_auto", "di"):
+        if method not in ("reverse", "chunked", "chunked_auto", "chunked_dense", "chunked_sparse", "di"):
             raise ValueError(
-                "flowfarm.jacobian_method must be 'reverse', 'chunked' (dense), "
-                f"'chunked_sparse', 'chunked_auto' or 'di', got {method!r}"
+                "flowfarm.jacobian_method must be 'reverse', 'chunked' (auto; alias 'chunked_auto'), "
+                f"'chunked_dense', 'chunked_sparse' or 'di', got {method!r}"
             )
         ff_options = model_options.get("flowfarm", {})
         self._auto = False
-        if method == "chunked_auto":
+        if method in ("chunked", "chunked_auto"):
             # dense for small farms; above the threshold a union-of-layouts sparse pattern that is
             # self-checked against the dense Jacobian at the first gradient (dense on failure)
             if self.N_turbines < int(ff_options.get("auto_dense_below", 25)):
-                method = "chunked"
+                method = "chunked_dense"
             else:
                 method = "chunked_sparse"
                 self._auto = True
@@ -468,7 +470,7 @@ class FLOWFarmComponent:
         self.sparse_struct = sparse_struct
 
         self._fastjac_cache = None
-        if method in ("chunked", "chunked_sparse") and not jl.seval("isdefined(Main, :ArdFastJac)"):
+        if method in ("chunked_dense", "chunked_sparse") and not jl.seval("isdefined(Main, :ArdFastJac)"):
             jl.seval(Path(__file__).with_name("_fastjac.jl").read_text())
         if method == "reverse":
             if not jl.seval("isdefined(Main, :ArdReverse)"):
@@ -481,7 +483,7 @@ class FLOWFarmComponent:
                 farm, n_states, self.N_turbines, 3 * self.N_turbines, opt_yaw=self.opt_yaw
             )
             self._reverse = True
-        elif method == "chunked":
+        elif method == "chunked_dense":
             n_states = len(np.asarray(farm.constants.wind_resource.wind_speeds).ravel())
             ndv = (3 if self.opt_yaw else 2) * self.N_turbines
             w = min(8, ndv)
@@ -538,7 +540,7 @@ class FLOWFarmComponent:
         return layouts
 
     def _finish_auto_setup(self, jl):
-        """chunked_auto above the dense threshold: union cutoffs, self-check, dense fallback."""
+        """chunked (auto) above the dense threshold: union cutoffs, self-check, dense fallback."""
         import warnings
 
         self._auto_pending = False
@@ -576,7 +578,7 @@ class FLOWFarmComponent:
         self.auto_info.update(selfcheck_rel=float(worst), selfcheck_bad_pairs=int(nbad))
         if worst > 1e-8:
             warnings.warn(
-                f"FLOWFarm chunked_auto: sparse Jacobian differs from dense by {worst:.2e} (relative) "
+                f"FLOWFarm chunked: sparse Jacobian differs from dense by {worst:.2e} (relative) "
                 f"at the start layout ({int(nbad)} bad turbine pairs over the checked states); "
                 "falling back to dense chunked ForwardDiff.",
                 RuntimeWarning,
