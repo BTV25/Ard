@@ -209,6 +209,32 @@ class FLOWFarmComponent:
             tolerance=tolerance,
         )
 
+        # Dense chunked ForwardDiff farm: preallocations dual-typed with chunk width w.
+        self._build_dense_farm = lambda w: flowfarm_module.build_wind_farm_struct(
+            x0_sparse,
+            turbine_x,
+            turbine_y,
+            turbine_z,
+            hub_heights,
+            turbine_yaw,
+            rotor_diameters,
+            ct_models,
+            generator_efficiencies,
+            cut_in_speeds,
+            cut_out_speeds,
+            rated_speeds,
+            rated_powers,
+            windresource,
+            power_models,
+            model_set,
+            update_fn,
+            AEP_scale=1,
+            opt_x=True,
+            opt_y=True,
+            opt_yaw=self.opt_yaw,
+            input_type=jl.ArdFastJac.dual_type(w),
+        )
+
         farm = flowfarm_module.build_wind_farm_struct(
             x0,
             turbine_x,
@@ -364,12 +390,17 @@ class FLOWFarmComponent:
         x_init, y_init = self._initial_turbine_positions(model_options, rotor_diameter)
         # flowfarm.jacobian_method: "reverse" (default; per-state Enzyme reverse, _reverse.jl,
         # FLOWFarmBatchPower and FLOWFarmAEP; the AEP component sums the per-state rows),
-        # "chunked" (color-seeded chunked ForwardDiff, _fastjac.jl) or "di"
-        # (FLOWFarm's DifferentiationInterface path). Discontinuous models (JensenTopHat,
-        # LocalTIModelMaxTI) give unreliable gradients with any method.
+        # "chunked" (dense chunked ForwardDiff, no sparsity pruning, _fastjac.jl; the forward
+        # fallback), "chunked_sparse" (opt-in: color-seeded chunked ForwardDiff on FLOWFarm's
+        # sparse pattern, whose cutoffs are set when the pattern is built and can be off) or
+        # "di" (FLOWFarm's DifferentiationInterface sparse path). Discontinuous models
+        # (JensenTopHat, LocalTIModelMaxTI) give unreliable gradients with any method.
         method = model_options.get("flowfarm", {}).get("jacobian_method", "reverse")
-        if method not in ("reverse", "chunked", "di"):
-            raise ValueError(f"flowfarm.jacobian_method must be 'reverse', 'chunked' or 'di', got {method!r}")
+        if method not in ("reverse", "chunked", "chunked_sparse", "di"):
+            raise ValueError(
+                "flowfarm.jacobian_method must be 'reverse', 'chunked' (dense), "
+                f"'chunked_sparse' or 'di', got {method!r}"
+            )
         x0, farm, sparse_farm, sparse_struct = self._build_farm_structures(
             jl,
             flowfarm_module,
@@ -397,6 +428,8 @@ class FLOWFarmComponent:
         self.sparse_struct = sparse_struct
 
         self._fastjac_cache = None
+        if method in ("chunked", "chunked_sparse") and not jl.seval("isdefined(Main, :ArdFastJac)"):
+            jl.seval(Path(__file__).with_name("_fastjac.jl").read_text())
         if method == "reverse":
             if not jl.seval("isdefined(Main, :ArdReverse)"):
                 jl.seval(Path(__file__).with_name("_reverse.jl").read_text())
@@ -409,8 +442,13 @@ class FLOWFarmComponent:
             )
             self._reverse = True
         elif method == "chunked":
-            if not jl.seval("isdefined(Main, :ArdFastJac)"):
-                jl.seval(Path(__file__).with_name("_fastjac.jl").read_text())
+            n_states = len(np.asarray(farm.constants.wind_resource.wind_speeds).ravel())
+            ndv = (3 if self.opt_yaw else 2) * self.N_turbines
+            w = min(8, ndv)
+            self.sparse_farm = self._build_dense_farm(w)
+            self.sparse_struct = jl.ArdFastJac.DenseState(self.sparse_farm, n_states, self.N_turbines, ndv, w)
+            self._dense = True
+        elif method == "chunked_sparse":
             # sparse struct is built lazily; take the state count from the wind resource
             n_states = len(np.asarray(farm.constants.wind_resource.wind_speeds).ravel())
             self._fastjac_cache = jl.ArdFastJac.FastCache(n_states)
@@ -443,6 +481,11 @@ class FLOWFarmComponent:
             # ReverseState takes the full [x; y; yaw] vector (yaw columns 0 when opt_yaw is False).
             aep_val, grad_val = getattr(jl.ArdReverse, "gradient!")(
                 self.sparse_farm, to_julia_vector_float64(jl, x_eval_np), self.sparse_struct
+            )
+        elif getattr(self, "_dense", False):
+            x_dense = x_eval_np if self.opt_yaw else x_eval_np[: 2 * self.N_turbines]
+            aep_val, grad_val = getattr(jl.ArdFastJac, "dense_gradient!")(
+                self.sparse_farm, to_julia_vector_float64(jl, x_dense), self.sparse_struct
             )
         else:
             if self.sparse_struct is None:

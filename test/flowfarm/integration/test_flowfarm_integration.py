@@ -239,11 +239,10 @@ def _aep_problem(method=None, opt_yaw=True):
 @pytest.mark.julia
 class TestFLOWFarmAEPJacobianMethod:
 
-    @pytest.mark.parametrize("method,tol", [("reverse", 1e-5), ("chunked", 5e-2)])
+    @pytest.mark.parametrize("method,tol", [("reverse", 1e-5), ("chunked", 1e-5)])
     @pytest.mark.parametrize("opt_yaw", [True, False])
     def test_gradient_matches_central_fd(self, method, tol, opt_yaw):
-        # Reverse is exact to FD noise. Chunked uses FLOWFarm's pruned sparsity pattern, which
-        # drops weakly-waking pairs and is only accurate to a few percent on this tiny farm.
+        # Reverse and dense chunked ForwardDiff are exact to FD noise (no pruning).
         prob, comp = _aep_problem(method, opt_yaw)
         assert bool(getattr(comp, "_reverse", False)) == (method == "reverse")
         wrt = ["aepFLOWFarm.x_turbines", "aepFLOWFarm.y_turbines"]
@@ -268,6 +267,22 @@ class TestFLOWFarmAEPJacobianMethod:
             # yaw FD (degrees, h = 0.05 deg) is noisier: power-curve kinks within the step
             wtol = max(tol, 1e-2) if w.endswith("yaw_turbines") else tol
             assert np.abs(g - fd).max() <= wtol * np.abs(fd).max(), w
+
+    def test_dense_chunked_matches_reverse(self):
+        # Same layout, both methods: dense chunked must agree with reverse to roundoff.
+        pr, _ = _aep_problem("reverse")
+        pc, comp = _aep_problem("chunked")
+        assert getattr(comp, "_dense", False)
+        wrt = [f"aepFLOWFarm.{v}_turbines" for v in ("x", "y", "yaw")]
+        tr = pr.compute_totals(of=["aepFLOWFarm.AEP_farm"], wrt=wrt)
+        tc = pc.compute_totals(of=["aepFLOWFarm.AEP_farm"], wrt=wrt)
+        for w in wrt:
+            a, b = tr["aepFLOWFarm.AEP_farm", w], tc["aepFLOWFarm.AEP_farm", w]
+            assert np.abs(a - b).max() <= 1e-12 * np.abs(a).max(), w
+
+    def test_chunked_sparse_is_opt_in(self):
+        _, comp = _aep_problem("chunked_sparse")
+        assert comp._fastjac_cache is not None and not getattr(comp, "_dense", False)
 
     def test_default_is_reverse(self):
         _, comp = _aep_problem(None)
