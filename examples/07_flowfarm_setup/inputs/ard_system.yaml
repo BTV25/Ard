@@ -48,6 +48,8 @@ modeling_options: &modeling_options
     wake_combination_model: LinearLocalVelocitySuperposition
     local_turbulence_model: LocalTIModelNoLocalTI
     tolerance: 1.0e-16
+    # jacobian_method: reverse
+    # opt_yaw: true
 
 system:
   type: group

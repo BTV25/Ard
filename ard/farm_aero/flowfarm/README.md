@@ -22,7 +22,7 @@ conda deactivate
 conda activate ard-FLOWFarm
 ```
 
-Install Julia (1.x) using juliaup from that environment:
+Install Julia **1.11 or newer** using juliaup from that environment (the default `reverse` Jacobian method needs Enzyme, which does not precompile on Julia 1.10; see [Jacobian method](#jacobian-method)):
 
 ```bash
 juliaup add release
@@ -50,7 +50,7 @@ Replace `<path-to-ard>` with the absolute path to the `Ard` directory. This down
 
 - Boots Julia through JuliaCall.
 - Activates Ard's local Julia environment (`julia_env`).
-- Loads FLOWFarm and builds farm and sparse structs for Ard components.
+- Loads FLOWFarm and builds farm and sparse structs for Ard components. Which FLOWFarm is loaded is set by the `julia_env` Manifest (there is no `[sources]` entry); hybridfarm develops it against a FLOWFarm worktree.
 - Exposes helper functions used by the component wrapper in `ard/farm_aero/flowfarm/component.py`.
 
 ## Threading and parallelism
@@ -84,6 +84,22 @@ These must be set before the first `import ard` call in your script or notebook.
 
 The FLOWFarm update callback in Ard is implemented entirely in Julia (not as a Python callable passed into Julia). This is required for thread safety: JuliaCall does not support calling back into Python from Julia threads other than the main thread. Using a pure Julia callback avoids this restriction and allows FLOWFarm to use all available Julia threads.
 
+## Jacobian method
+
+`modeling_options.flowfarm.jacobian_method` selects how `FLOWFarmAEP` / `FLOWFarmBatchPower` compute gradients:
+
+| value | what it does |
+|---|---|
+| `reverse` (default) | Per-state Enzyme reverse gradient (`_reverse.jl`), threaded over states. Needs Julia 1.11+. With a `CumulativeCurl` deficit model and FLOWFarm's Enzyme extension (`FLOWFarmEnzymeExt`) loaded, it uses the hand-written `CumulativeCurlAD` rule (about 1.4-2x faster, same gradient to roundoff); `reverse_cc_rule: off` forces plain Enzyme. If the extension is not loaded (e.g. a stale `Manifest.toml`; re-run `Pkg.resolve()`), it falls back to plain Enzyme automatically. |
+| `chunked` | Forward chunked ForwardDiff, automatic: dense below `auto_dense_below` turbines (default 25); at or above it a guarded sparse pattern (union of `union_snapshots` = 8 layouts with `union_seed` = 0 and `min_spacing_D` = 3.0) that is self-checked against the dense Jacobian at the first gradient, with dense fallback (RuntimeWarning). Alias: `chunked_auto`. |
+| `chunked_dense` | Explicit dense chunked ForwardDiff, no sparsity pruning. |
+| `chunked_sparse` | Opt-in color-seeded sparse; cutoffs are fixed when the pattern is built and can be wrong away from the start layout. |
+| `di` | FLOWFarm's DifferentiationInterface sparse path (legacy; pruned pattern, loosest agreement). |
+
+`opt_yaw` (default `true`): `false` removes the yaw columns (fewer colors, skips the yaw adjoint); `yaw_turbines` must then be 0, otherwise a ValueError is raised. Discontinuous models (`JensenTopHat`, `LocalTIModelMaxTI`) give unreliable gradients with any method.
+
+On Julia 1.10 set `jacobian_method: chunked` (Enzyme cannot be loaded there). `julia_env/Project.toml` requires Julia 1.11 because Enzyme is a hard dependency of the environment and the default method uses it.
+
 ## Tolerance behavior
 
 - FLOWFarm sparse-structure tolerance uses `modeling_options.flowfarm.tolerance`.
@@ -93,8 +109,18 @@ Example:
 
 ```yaml
 modeling_options:
-	flowfarm:
-		tolerance: 1.0e-16
+  flowfarm:
+    tolerance: 1.0e-16
+    # jacobian_method: reverse
+    # opt_yaw: true
+```
+
+## Running the tests
+
+Run the Julia tests with `PYTHON_JULIACALL_HANDLE_SIGNALS=yes` (and `PYTHON_JULIACALL_THREADS` as needed), on Julia 1.11+; otherwise Julia threads can segfault or hang under JuliaCall:
+
+```bash
+PYTHON_JULIACALL_HANDLE_SIGNALS=yes pytest -m julia test/flowfarm/integration
 ```
 
 ## Supported FLOWFarm names
@@ -120,6 +146,8 @@ Use the exact FLOWFarm constructor and model names expected by the integration.
 - `_jl_bootstrap.py`: Julia runtime bootstrap and env activation helpers.
 - `flowfarm_model.py`: FLOWFarm model-construction utilities and option validation.
 - `component.py`: OpenMDAO component wrapper that uses this integration.
+- `_fastjac.jl`: dense and color-seeded sparse chunked ForwardDiff gradients (`chunked*`).
+- `_reverse.jl`: per-state Enzyme reverse gradient (`reverse`).
 
 ## Troubleshooting
 
@@ -138,7 +166,7 @@ This comes from your **global** Julia environment, not Ard's. JuliaCall triggers
 
 ### Wrong Julia version being used
 
-If Julia 1.11+ is picked up instead of 1.10, check your `PATH`. `juliaup default 1.10` sets the default for commands run via juliaup, but if `/opt/homebrew/bin/julia` or another system Julia takes precedence in your shell, JuliaCall may use that instead.
+Use Julia 1.11 or newer for the default `reverse` method. If an older Julia (e.g. 1.10) is picked up, check your `PATH`: `juliaup default release` sets the default for commands run via juliaup, but if `/opt/homebrew/bin/julia` or another system Julia takes precedence in your shell, JuliaCall may use that instead. On Julia 1.10 set `jacobian_method: chunked`.
 
 ### Kernel/process crash when threads > 1
 

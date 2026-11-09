@@ -7,4 +7,4 @@ FLOWFarm = "eb2d4cfc-2064-11ea-0a1c-63d372e6a848"
 
 [compat]
 FLOWFarm = "1"
-julia = "1.10"
+julia = "1.11"
