@@ -211,7 +211,7 @@ class TestFLOWFarmAEPIntegration:
 # ---------------------------------------------------------------------------
 
 
-def _aep_problem(method=None, opt_yaw=True):
+def _aep_problem(method=None, opt_yaw=True, wake=None, extra=None):
     from ard.farm_aero.flowfarm import FLOWFarmAEP
 
     modeling_options = _make_aep_modeling_options()
@@ -219,6 +219,9 @@ def _aep_problem(method=None, opt_yaw=True):
         modeling_options["flowfarm"]["jacobian_method"] = method
     if not opt_yaw:
         modeling_options["flowfarm"]["opt_yaw"] = False
+    if wake is not None:
+        modeling_options["flowfarm"]["wake_deficit_model"] = wake
+    modeling_options["flowfarm"].update(extra or {})
     model = om.Group()
     comp = model.add_subsystem("aepFLOWFarm", FLOWFarmAEP(modeling_options=modeling_options))
     prob = om.Problem(model)
@@ -279,6 +282,38 @@ class TestFLOWFarmAEPJacobianMethod:
         for w in wrt:
             a, b = tr["aepFLOWFarm.AEP_farm", w], tc["aepFLOWFarm.AEP_farm", w]
             assert np.abs(a - b).max() <= 1e-12 * np.abs(a).max(), w
+
+    @staticmethod
+    def _aep_grad(prob):
+        wrt = [f"aepFLOWFarm.{v}_turbines" for v in ("x", "y", "yaw")]
+        t = prob.compute_totals(of=["aepFLOWFarm.AEP_farm"], wrt=wrt)
+        return np.concatenate([t["aepFLOWFarm.AEP_farm", w].ravel() for w in wrt])
+
+    @pytest.mark.parametrize("wake", ["GaussYawVariableSpread", "CumulativeCurl"])
+    @pytest.mark.parametrize("below", [25, 1])  # 25: dense (N=9 < 25); 1: union-sparse path
+    def test_chunked_auto_matches_reverse(self, wake, below):
+        pr, _ = _aep_problem("reverse", wake=wake)
+        pa, comp = _aep_problem("chunked_auto", wake=wake, extra={"auto_dense_below": below})
+        ga = self._aep_grad(pa)
+        gr = self._aep_grad(pr)
+        assert np.abs(ga - gr).max() <= 1e-12 * np.abs(gr).max()
+        assert getattr(comp, "_dense", False) == (below == 25)
+        if below == 1:
+            assert comp.auto_info["fallback"] is False
+            assert comp.auto_info["density_union"] >= comp.auto_info["density_single"] - 1e-12
+
+    def test_chunked_auto_selfcheck_falls_back_on_bad_cutoff(self):
+        pr, _ = _aep_problem("reverse", wake="CumulativeCurl")
+        with pytest.warns(RuntimeWarning, match="falling back to dense"):
+            pa, comp = _aep_problem(
+                "chunked_auto",
+                wake="CumulativeCurl",
+                extra={"auto_dense_below": 1, "auto_threshold_scale": 1e30},
+            )
+            ga = self._aep_grad(pa)
+        assert comp._dense and comp.auto_info["fallback"] and comp.auto_info["selfcheck_bad_pairs"] > 0
+        gr = self._aep_grad(pr)
+        assert np.abs(ga - gr).max() <= 1e-12 * np.abs(gr).max()
 
     def test_chunked_sparse_is_opt_in(self):
         _, comp = _aep_problem("chunked_sparse")

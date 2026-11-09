@@ -209,6 +209,35 @@ class FLOWFarmComponent:
             tolerance=tolerance,
         )
 
+        self._tolerance = tolerance
+        # ForwardDiffJacobian farm used by FLOWFarm to compute the sparsity cutoffs.
+        self._build_fd_farm = lambda: flowfarm_module.build_wind_farm_struct(
+            x0_sparse,
+            turbine_x,
+            turbine_y,
+            turbine_z,
+            hub_heights,
+            turbine_yaw,
+            rotor_diameters,
+            ct_models,
+            generator_efficiencies,
+            cut_in_speeds,
+            cut_out_speeds,
+            rated_speeds,
+            rated_powers,
+            windresource,
+            power_models,
+            model_set,
+            update_fn,
+            AEP_scale=1,
+            opt_x=True,
+            opt_y=True,
+            opt_yaw=self.opt_yaw,
+            input_type="ForwardDiffJacobian",
+        )
+        self._x_start = x_init
+        self._y_start = y_init
+        self._rotor_diameter = rotor_diameter
         # Dense chunked ForwardDiff farm: preallocations dual-typed with chunk width w.
         self._build_dense_farm = lambda w: flowfarm_module.build_wind_farm_struct(
             x0_sparse,
@@ -396,11 +425,22 @@ class FLOWFarmComponent:
         # "di" (FLOWFarm's DifferentiationInterface sparse path). Discontinuous models
         # (JensenTopHat, LocalTIModelMaxTI) give unreliable gradients with any method.
         method = model_options.get("flowfarm", {}).get("jacobian_method", "reverse")
-        if method not in ("reverse", "chunked", "chunked_sparse", "di"):
+        if method not in ("reverse", "chunked", "chunked_sparse", "chunked_auto", "di"):
             raise ValueError(
                 "flowfarm.jacobian_method must be 'reverse', 'chunked' (dense), "
-                f"'chunked_sparse' or 'di', got {method!r}"
+                f"'chunked_sparse', 'chunked_auto' or 'di', got {method!r}"
             )
+        ff_options = model_options.get("flowfarm", {})
+        self._auto = False
+        if method == "chunked_auto":
+            # dense for small farms; above the threshold a union-of-layouts sparse pattern that is
+            # self-checked against the dense Jacobian at the first gradient (dense on failure)
+            if self.N_turbines < int(ff_options.get("auto_dense_below", 25)):
+                method = "chunked"
+            else:
+                method = "chunked_sparse"
+                self._auto = True
+                self._auto_pending = True
         x0, farm, sparse_farm, sparse_struct = self._build_farm_structures(
             jl,
             flowfarm_module,
@@ -465,6 +505,90 @@ class FLOWFarmComponent:
                 "FLOWFarm opt_yaw is False but yaw_turbines is nonzero; set opt_yaw: true."
             )
 
+    def _union_layouts(self, K, seed, min_spacing_D):
+        """K seeded random layouts inside the convex hull of the start layout, spacing >= min_spacing_D."""
+        from scipy.spatial import Delaunay
+
+        N = self.N_turbines
+        pts = np.column_stack([self._x_start, self._y_start])
+        D = self._rotor_diameter
+        lo, hi = pts.min(axis=0), pts.max(axis=0)
+        hull = Delaunay(pts) if N >= 3 else None
+        d0 = np.linalg.norm(pts[:, None] - pts[None], axis=-1)
+        d0 = d0[np.triu_indices(N, 1)].min() if N > 1 else np.inf
+        rng = np.random.default_rng(seed)
+        layouts = []
+        for _ in range(K):
+            smin = min(min_spacing_D * D, d0)  # never ask for more than the start layout has
+            while True:
+                placed = []
+                for _try in range(200 * N):
+                    q = rng.uniform(lo, hi)
+                    if hull is not None and hull.find_simplex(q) < 0:
+                        continue
+                    if placed and np.min(np.linalg.norm(np.asarray(placed) - q, axis=1)) < smin:
+                        continue
+                    placed.append(q)
+                    if len(placed) == N:
+                        break
+                if len(placed) == N:
+                    break
+                smin *= 0.9
+            layouts.append(np.asarray(placed))
+        return layouts
+
+    def _finish_auto_setup(self, jl):
+        """chunked_auto above the dense threshold: union cutoffs, self-check, dense fallback."""
+        import warnings
+
+        self._auto_pending = False
+        opts = self.options["modeling_options"].get("flowfarm", {})
+        K = int(opts.get("union_snapshots", 8))
+        N = self.N_turbines
+        self.sparse_farm, self.sparse_struct = self._build_sparse()
+        self._fastjac_cache = jl.ArdFastJac.FastCache(
+            len(np.asarray(self.farm.constants.wind_resource.wind_speeds).ravel())
+        )
+
+        def design(xy):
+            v = np.concatenate([xy[:, 0], xy[:, 1]])
+            return np.concatenate([v, np.zeros(N)]) if self.opt_yaw else v
+
+        x0 = to_julia_vector_float64(jl, design(np.column_stack([self._x_start, self._y_start])))
+        self.auto_info = {"density_single": float(jl.ArdFastJac.pair_density(self.sparse_struct, x0))}
+        if K > 0:
+            farm_fd = self._build_fd_farm()
+            for lay in self._union_layouts(K, int(opts.get("union_seed", 0)), float(opts.get("min_spacing_D", 3.0))):
+                getattr(jl.ArdFastJac, "union_snapshot!")(
+                    self.sparse_struct, farm_fd, to_julia_vector_float64(jl, design(lay)), self._tolerance
+                )
+        scale = float(opts.get("auto_threshold_scale", 1.0))  # debug/test hook: corrupt the cutoffs
+        if scale != 1.0:
+            getattr(jl.ArdFastJac, "scale_thresholds!")(self.sparse_struct, scale)
+        self.auto_info["density_union"] = float(jl.ArdFastJac.pair_density(self.sparse_struct, x0))
+
+        n_states = len(np.asarray(self.farm.constants.wind_resource.wind_speeds).ravel())
+        ndv = (3 if self.opt_yaw else 2) * N
+        w = min(8, ndv)
+        dense_farm = self._build_dense_farm(w)
+        dense = jl.ArdFastJac.DenseState(dense_farm, n_states, N, ndv, w)
+        worst, nbad = jl.ArdFastJac.selfcheck(self.sparse_struct, self._fastjac_cache, dense, x0, 8, 1e-8)
+        self.auto_info.update(selfcheck_rel=float(worst), selfcheck_bad_pairs=int(nbad))
+        if worst > 1e-8:
+            warnings.warn(
+                f"FLOWFarm chunked_auto: sparse Jacobian differs from dense by {worst:.2e} (relative) "
+                f"at the start layout ({int(nbad)} bad turbine pairs over the checked states); "
+                "falling back to dense chunked ForwardDiff.",
+                RuntimeWarning,
+            )
+            self._fastjac_cache = None
+            self.sparse_farm = dense_farm
+            self.sparse_struct = dense
+            self._dense = True
+            self.auto_info["fallback"] = True
+        else:
+            self.auto_info["fallback"] = False
+
     def _evaluate_sparse(self, x_eval_np):
         """Run sparse gradient evaluation once and cache AEP/gradient for reuse."""
         if hasattr(self, "_cached_sparse_x") and np.array_equal(
@@ -482,6 +606,9 @@ class FLOWFarmComponent:
             aep_val, grad_val = getattr(jl.ArdReverse, "gradient!")(
                 self.sparse_farm, to_julia_vector_float64(jl, x_eval_np), self.sparse_struct
             )
+        elif getattr(self, "_auto_pending", False):
+            self._finish_auto_setup(jl)
+            return self._evaluate_sparse(x_eval_np)
         elif getattr(self, "_dense", False):
             x_dense = x_eval_np if self.opt_yaw else x_eval_np[: 2 * self.N_turbines]
             aep_val, grad_val = getattr(jl.ArdFastJac, "dense_gradient!")(

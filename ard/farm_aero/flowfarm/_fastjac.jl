@@ -136,7 +136,7 @@ function DenseState(farm, n_states::Int, n::Int, ndv::Int, w::Int)
     return DenseState{D,typeof(farm)}(farm, w, ws, zeros(n_states, ndv), zeros(n_states), zeros(n, n_states))
 end
 
-function dense_state!(ds::DenseState{D}, x, state, pid, lock) where {T,W,D<:FD.Dual{T,Float64,W}}
+function dense_state!(ds::DenseState{D}, x, state, pid, lock, J = nothing) where {T,W,D<:FD.Dual{T,Float64,W}}
     res = ds.farm.constants.wind_resource
     ndv = length(x)
     n = size(ds.turbine_powers, 1)
@@ -173,7 +173,9 @@ function dense_state!(ds::DenseState{D}, x, state, pid, lock) where {T,W,D<:FD.D
             col <= ndv || break
             s = 0.0
             for i = 1:n
-                s += FD.partials(pd[i])[lane]
+                pij = FD.partials(pd[i])[lane]
+                s += pij
+                J === nothing || (J[i, col] = pij)
             end
             sg[col] = s
         end
@@ -201,6 +203,82 @@ function dense_gradient!(farm, x, ds::DenseState)
         end
     end
     return sum(ds.state_powers), vec(sum(ds.state_gradients; dims = 1))
+end
+
+# ---- union of sparsity cutoffs over several layouts ("chunked_auto") --------------------------
+# FLOWFarm keeps one deficit cutoff per wind state (0.1 x the smallest deficit that still has a
+# nonzero derivative at the calibration layout); a pair is kept when its deficit >= cutoff. The
+# union of the patterns of several layouts is the pattern of the smallest cutoff over them.
+
+"""Lower ss.deficit_thresholds to min(current, cutoffs computed at layout x with farm_fd)."""
+function union_snapshot!(ss, farm_fd, x, tolerance)
+    ns = length(ss.deficit_thresholds)
+    jac = Vector{Any}(undef, ns)
+    thr = zeros(ns)
+    pow = zeros(size(ss.turbine_powers, 1), ns)
+    FF.calculate_thresholds!(jac, thr, x, farm_fd, ss.farm, tolerance, pow, ns)
+    ss.deficit_thresholds .= min.(ss.deficit_thresholds, thr)
+    return nothing
+end
+
+scale_thresholds!(ss, f) = (ss.deficit_thresholds .*= f; nothing)
+
+"""Fraction of off-diagonal turbine pairs kept by the current cutoffs at layout x, over states with wind."""
+function pair_density(ss, x)
+    farm = ss.farm
+    res = farm.constants.wind_resource
+    n = length(farm.turbine_x)
+    kept = 0
+    total = 0
+    for st in eachindex(ss.deficit_thresholds)
+        (res.wind_speeds[st] == 0.0 || res.wind_probabilities[st] == 0.0) && continue
+        pow = zeros(n)
+        FF.calculate_wind_state_power!(pow, x, farm, st; prealloc_id = 1)
+        d = view(farm.preallocations.prealloc_wake_deficits, :, :, 1)
+        for j = 1:n, i = 1:n
+            i == j && continue
+            total += 1
+            d[i, j] >= ss.deficit_thresholds[st] && (kept += 1)
+        end
+    end
+    return total == 0 ? 0.0 : kept / total
+end
+
+"""
+Compare the sparse Jacobian with the dense one at x on up to `nmax` evenly spaced states with wind
+above cut-in. Returns (max relative difference, number of bad (state, turbine, turbine) pairs).
+"""
+function selfcheck(ss, c::FastCache, ds::DenseState, x, nmax::Int, rtol::Float64)
+    farm = ss.farm
+    res = farm.constants.wind_resource
+    active = [st for st in eachindex(ss.deficit_thresholds) if res.wind_speeds[st] != 0.0 &&
+              res.wind_probabilities[st] != 0.0 &&
+              !FF.below_cutin_speed(res, st, farm.constants.turbine_z, farm.hub_height, farm.constants.cut_in_speed)]
+    isempty(active) && return 0.0, 0
+    pick = unique(active[round.(Int, range(1, length(active), length = min(nmax, length(active))))])
+    n = size(ds.turbine_powers, 1)
+    ndv = length(x)
+    nv = ndv ÷ n
+    Jd = zeros(n, ndv)
+    worst = 0.0
+    nbad = 0
+    for st in pick
+        state_gradient!(ss, c, x, st, 1, nothing)
+        Js = ss.jacobians[st]
+        fill!(Jd, 0.0)
+        dense_state!(ds, x, st, 1, nothing, Jd)
+        scale = maximum(abs, Jd)
+        scale == 0.0 && continue
+        for j = 1:n, i = 1:n
+            e = 0.0
+            for k = 0:nv-1
+                e = max(e, abs(Js[i, j + k * n] - Jd[i, j + k * n]))
+            end
+            worst = max(worst, e / scale)
+            e / scale > rtol && (nbad += 1)
+        end
+    end
+    return worst, nbad
 end
 
 end # module
