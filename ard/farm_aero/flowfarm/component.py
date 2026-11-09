@@ -363,15 +363,13 @@ class FLOWFarmComponent:
 
         x_init, y_init = self._initial_turbine_positions(model_options, rotor_diameter)
         # flowfarm.jacobian_method: "reverse" (default; per-state Enzyme reverse, _reverse.jl,
-        # BatchPower only; needs the flowfarm-enzyme FLOWFarm with positional entry points; other
-        # components fall back to chunked), "chunked" (color-seeded chunked ForwardDiff, _fastjac.jl) or "di"
+        # FLOWFarmBatchPower and FLOWFarmAEP; the AEP component sums the per-state rows),
+        # "chunked" (color-seeded chunked ForwardDiff, _fastjac.jl) or "di"
         # (FLOWFarm's DifferentiationInterface path). Discontinuous models (JensenTopHat,
         # LocalTIModelMaxTI) give unreliable gradients with any method.
         method = model_options.get("flowfarm", {}).get("jacobian_method", "reverse")
         if method not in ("reverse", "chunked", "di"):
             raise ValueError(f"flowfarm.jacobian_method must be 'reverse', 'chunked' or 'di', got {method!r}")
-        if method == "reverse" and not isinstance(self, FLOWFarmBatchPower):
-            method = "chunked"
         x0, farm, sparse_farm, sparse_struct = self._build_farm_structures(
             jl,
             flowfarm_module,

@@ -204,3 +204,75 @@ class TestFLOWFarmAEPIntegration:
 
         assert aep_tight < aep_spread
 
+
+
+# ---------------------------------------------------------------------------
+# FLOWFarmAEP jacobian_method option
+# ---------------------------------------------------------------------------
+
+
+def _aep_problem(method=None, opt_yaw=True):
+    from ard.farm_aero.flowfarm import FLOWFarmAEP
+
+    modeling_options = _make_aep_modeling_options()
+    if method is not None:
+        modeling_options["flowfarm"]["jacobian_method"] = method
+    if not opt_yaw:
+        modeling_options["flowfarm"]["opt_yaw"] = False
+    model = om.Group()
+    comp = model.add_subsystem("aepFLOWFarm", FLOWFarmAEP(modeling_options=modeling_options))
+    prob = om.Problem(model)
+    prob.setup()
+    X, Y = _grid_layout(3, _SPACING, _ROTOR_DIAMETER)
+    # Jitter off the regular grid: exactly aligned turbines sit on wake on/off and sort-tie
+    # kinks where forward and reverse AD legitimately return different subgradients.
+    rng = np.random.default_rng(1)
+    X = X + rng.uniform(-0.3, 0.3, len(X)) * _ROTOR_DIAMETER
+    Y = Y + rng.uniform(-0.3, 0.3, len(Y)) * _ROTOR_DIAMETER
+    prob.set_val("aepFLOWFarm.x_turbines", X)
+    prob.set_val("aepFLOWFarm.y_turbines", Y)
+    prob.set_val("aepFLOWFarm.yaw_turbines", np.zeros(len(X)))
+    prob.run_model()
+    return prob, comp
+
+
+@pytest.mark.julia
+class TestFLOWFarmAEPJacobianMethod:
+
+    @pytest.mark.parametrize("method,tol", [("reverse", 1e-5), ("chunked", 5e-2)])
+    @pytest.mark.parametrize("opt_yaw", [True, False])
+    def test_gradient_matches_central_fd(self, method, tol, opt_yaw):
+        # Reverse is exact to FD noise. Chunked uses FLOWFarm's pruned sparsity pattern, which
+        # drops weakly-waking pairs and is only accurate to a few percent on this tiny farm.
+        prob, comp = _aep_problem(method, opt_yaw)
+        assert bool(getattr(comp, "_reverse", False)) == (method == "reverse")
+        wrt = ["aepFLOWFarm.x_turbines", "aepFLOWFarm.y_turbines"]
+        if opt_yaw:
+            wrt.append("aepFLOWFarm.yaw_turbines")
+        totals = prob.compute_totals(of=["aepFLOWFarm.AEP_farm"], wrt=wrt)
+        h = 0.05
+        for w in wrt:
+            x0 = np.array(prob.get_val(w))
+            fd = np.zeros_like(x0)
+            for k in range(len(x0)):
+                vals = []
+                for sgn in (1.0, -1.0):
+                    x = x0.copy()
+                    x[k] += sgn * h
+                    prob.set_val(w, x)
+                    prob.run_model()
+                    vals.append(_as_scalar(prob.get_val("aepFLOWFarm.AEP_farm")))
+                fd[k] = (vals[0] - vals[1]) / (2.0 * h)
+            prob.set_val(w, x0)
+            g = totals["aepFLOWFarm.AEP_farm", w].ravel()
+            # yaw FD (degrees, h = 0.05 deg) is noisier: power-curve kinks within the step
+            wtol = max(tol, 1e-2) if w.endswith("yaw_turbines") else tol
+            assert np.abs(g - fd).max() <= wtol * np.abs(fd).max(), w
+
+    def test_default_is_reverse(self):
+        _, comp = _aep_problem(None)
+        assert comp._reverse is True
+
+    def test_invalid_method_raises(self):
+        with pytest.raises(ValueError, match="jacobian_method"):
+            _aep_problem("bogus")
