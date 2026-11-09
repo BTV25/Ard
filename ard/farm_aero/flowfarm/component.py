@@ -44,6 +44,7 @@ _ARD_OPTIONS = (
     "union_snapshots",
     "union_seed",
     "min_spacing_D",
+    "reverse_cc_rule",
 )
 
 
@@ -57,6 +58,13 @@ class FLOWFarmComponent:
     def initialize(self):
         # This mixin is invoked explicitly by derived classes; no super() chain here.
         return
+
+    def _reverse_cc_rule(self):
+        """flowfarm.reverse_cc_rule: "auto" (default) or "off"."""
+        mode = self.options["modeling_options"].get("flowfarm", {}).get("reverse_cc_rule", "auto")
+        if mode not in ("auto", "off"):
+            raise ValueError(f"flowfarm.reverse_cc_rule must be 'auto' or 'off', got {mode!r}")
+        return mode == "auto"
 
     def _get_air_density(self, wind_resource):
         return float(wind_resource.get("air_density", 1.225))
@@ -439,7 +447,8 @@ class FLOWFarmComponent:
             # opt_yaw False (yaw not a design variable, must stay 0): skips the yaw adjoint and
             # the (identically zero) yaw deflection; yaw columns of state_gradients are then 0.
             self.sparse_struct = jl.ArdReverse.ReverseState(
-                farm, n_states, self.N_turbines, 3 * self.N_turbines, opt_yaw=self.opt_yaw
+                farm, n_states, self.N_turbines, 3 * self.N_turbines, opt_yaw=self.opt_yaw,
+                cc_rule=self._reverse_cc_rule(),
             )
             self._reverse = True
         elif method == "chunked_dense":
@@ -644,6 +653,9 @@ class FLOWFarmAEP(templates.FarmAEPTemplate, FLOWFarmComponent):
       "chunked_dense", "chunked_sparse" (opt-in; cutoffs fixed at the start layout) or "di"
       (FLOWFarm's DifferentiationInterface sparse path).
     - ``opt_yaw`` (True): False drops the yaw partials; ``yaw_turbines`` must then stay 0.
+    - ``reverse_cc_rule`` ("auto"): "reverse" with a CumulativeCurl deficit model uses FLOWFarm's
+      hand-written CumulativeCurlAD rule (FLOWFarmEnzymeExt, ~1.4-2x faster) when the extension is
+      loaded, else plain Enzyme; "off" always uses plain Enzyme.
     - ``auto_dense_below`` (25): turbine count below which "chunked" uses the dense path.
     - ``union_snapshots`` (8): layouts used to build the union sparsity cutoffs ("chunked" above
       the threshold; 0 disables the union).
@@ -690,6 +702,9 @@ class FLOWFarmBatchPower(templates.BatchFarmPowerTemplate, FLOWFarmComponent):
       "chunked_dense", "chunked_sparse" (opt-in; cutoffs fixed at the start layout) or "di"
       (FLOWFarm's DifferentiationInterface sparse path).
     - ``opt_yaw`` (True): False drops the yaw partials; ``yaw_turbines`` must then stay 0.
+    - ``reverse_cc_rule`` ("auto"): "reverse" with a CumulativeCurl deficit model uses FLOWFarm's
+      hand-written CumulativeCurlAD rule (FLOWFarmEnzymeExt, ~1.4-2x faster) when the extension is
+      loaded, else plain Enzyme; "off" always uses plain Enzyme.
     - ``auto_dense_below`` (25): turbine count below which "chunked" uses the dense path.
     - ``union_snapshots`` (8): layouts used to build the union sparsity cutoffs ("chunked" above
       the threshold; 0 disables the union).

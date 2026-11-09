@@ -109,11 +109,24 @@ end
 # opt_yaw = false (yaw not a design variable, must be 0): yaw is Const, the yaw columns of
 # state_gradients stay 0, and GaussYawVariableSpreadDeflection (identically 0 at zero yaw, with
 # zero x/y derivatives there) is replaced by NoYawDeflection. Primal unchanged; ~1.4x faster.
-function ReverseState(farm, n_states::Int, n::Int, ndv::Int; opt_yaw::Bool=true)
+#
+# cc_rule = true: with a CumulativeCurl deficit model and FLOWFarm's Enzyme extension loaded
+# (FLOWFarmEnzymeExt), the deficit model is wrapped in FF.CumulativeCurlAD (hand-written pair rule;
+# same primal and gradient to roundoff). Otherwise the model set is used as is (plain Enzyme).
+function use_cc_rule(ms, cc_rule::Bool)
+    return cc_rule && ms.wake_deficit_model isa FF.CumulativeCurl &&
+        isdefined(FF, :CumulativeCurlAD) && Base.get_extension(FF, :FLOWFarmEnzymeExt) !== nothing
+end
+
+function ReverseState(farm, n_states::Int, n::Int, ndv::Int; opt_yaw::Bool=true, cc_rule::Bool=true)
     ms = farm.constants.model_set
     if !opt_yaw && ms.wake_deflection_model isa FF.GaussYawVariableSpreadDeflection
         ms = FF.WindFarmModelSet(ms.wake_deficit_model, FF.NoYawDeflection(), ms.wake_combination_model,
             ms.local_ti_model, ms.point_velocity_average_factor)
+    end
+    if use_cc_rule(ms, cc_rule)
+        ms = FF.WindFarmModelSet(FF.CumulativeCurlAD(ms.wake_deficit_model), ms.wake_deflection_model,
+            ms.wake_combination_model, ms.local_ti_model, ms.point_velocity_average_factor)
     end
     case = Case(farm.constants.turbine_z, farm.hub_height, farm.turbine_yaw, farm.rotor_diameter, farm.constants, ms)
     nact = opt_yaw ? ndv : 2n

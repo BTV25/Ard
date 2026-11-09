@@ -344,6 +344,24 @@ class TestFLOWFarmAEPJacobianMethod:
         gr, gd = self._aep_grad(pr), self._aep_grad(pd)
         assert np.isfinite(gd).all() and np.abs(gd - gr).max() <= 0.1 * np.abs(gr).max()
 
+    @pytest.mark.parametrize("opt_yaw", [True, False])
+    def test_reverse_cc_rule_matches_plain_enzyme(self, opt_yaw):
+        # CumulativeCurlAD hand rule (FLOWFarmEnzymeExt) vs plain Enzyme reverse
+        pa, ca = _aep_problem("reverse", opt_yaw=opt_yaw, wake="CumulativeCurl")
+        po, co = _aep_problem("reverse", opt_yaw=opt_yaw, wake="CumulativeCurl", extra={"reverse_cc_rule": "off"})
+        used = lambda c: "CumulativeCurlAD" in str(c._jl.typeof(c.sparse_struct.case.model_set.wake_deficit_model))
+        assert used(ca) and not used(co)
+        ga, go = self._aep_grad(pa), self._aep_grad(po)
+        assert np.abs(ga - go).max() <= 1e-12 * np.abs(go).max()
+
+    def test_reverse_cc_rule_not_used_for_other_wake_models(self):
+        _, c = _aep_problem("reverse", wake="GaussYawVariableSpread")
+        assert "CumulativeCurlAD" not in str(c._jl.typeof(c.sparse_struct.case.model_set.wake_deficit_model))
+
+    def test_invalid_reverse_cc_rule_raises(self):
+        with pytest.raises(ValueError, match="reverse_cc_rule"):
+            _aep_problem("reverse", extra={"reverse_cc_rule": "maybe"})
+
     def test_invalid_method_raises(self):
         with pytest.raises(ValueError, match="jacobian_method"):
             _aep_problem("bogus")
