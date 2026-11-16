@@ -90,11 +90,8 @@ The FLOWFarm update callback in Ard is implemented entirely in Julia (not as a P
 
 | value | what it does |
 |---|---|
-| `reverse` (default) | Per-state Enzyme reverse gradient (`_reverse.jl`), threaded over states. Needs Julia 1.11+. With a `CumulativeCurl` deficit model and FLOWFarm's Enzyme extension (`FLOWFarmEnzymeExt`) loaded, it uses the hand-written `CumulativeCurlAD` rule (about 1.4-2x faster, same gradient to roundoff); `reverse_cc_rule: off` forces plain Enzyme. If the extension is not loaded (e.g. a stale `Manifest.toml`; re-run `Pkg.resolve()`), it falls back to plain Enzyme automatically. |
-| `chunked` | Forward chunked ForwardDiff, automatic: dense below `auto_dense_below` turbines (default 25); at or above it a guarded sparse pattern (union of `union_snapshots` = 8 layouts with `union_seed` = 0 and `min_spacing_D` = 3.0) that is self-checked against the dense Jacobian at the first gradient, with dense fallback (RuntimeWarning). Alias: `chunked_auto`. |
-| `chunked_dense` | Explicit dense chunked ForwardDiff, no sparsity pruning. |
-| `chunked_sparse` | Opt-in color-seeded sparse; cutoffs are fixed when the pattern is built and can be wrong away from the start layout. |
-| `di` | FLOWFarm's DifferentiationInterface sparse path (legacy; pruned pattern, loosest agreement). |
+| `reverse` (default) | Per-state Enzyme reverse gradient (`_reverse.jl`), threaded over states. Needs Julia 1.11+. |
+| `chunked` | Forward chunked ForwardDiff, automatic: dense below `auto_dense_below` turbines (default 25); at or above it a guarded sparse pattern (union of `union_snapshots` = 8 layouts with `union_seed` = 0 and `min_spacing_D` = 3.0) that is self-checked against the dense Jacobian at the first gradient, with dense fallback (RuntimeWarning). |
 
 `opt_yaw` (default `true`): `false` removes the yaw columns (fewer colors, skips the yaw adjoint); `yaw_turbines` must then be 0, otherwise a ValueError is raised. Discontinuous models (`JensenTopHat`, `LocalTIModelMaxTI`) give unreliable gradients with any method.
 

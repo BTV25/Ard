@@ -1,9 +1,8 @@
 # Chunked ForwardDiff gradients of the farm power, two variants:
 #  * DenseState / dense_gradient!: dense chunked ForwardDiff (every design variable seeded,
-#    no sparsity pattern, no pruning; exact to roundoff). `chunked_dense`, and `chunked` below
-#    auto_dense_below.
+#    no sparsity pattern, no pruning; exact to roundoff). `chunked` below auto_dense_below.
 #  * FastCache / gradient!: color-seeded sparse chunked Jacobian on FLOWFarm's unstable-pattern
-#    sparse path (`chunked_sparse`, and `chunked` above the threshold). Replaces the
+#    sparse path (`chunked` above the threshold). Replaces the
 #    DifferentiationInterface jacobian! call; the primal evaluation, sparsity pattern detection
 #    and recoloring triggers are still FLOWFarm's own.
 module ArdFastJac
@@ -207,7 +206,7 @@ function dense_gradient!(farm, x, ds::DenseState)
     return sum(ds.state_powers), vec(sum(ds.state_gradients; dims = 1))
 end
 
-# ---- union of sparsity cutoffs over several layouts ("chunked", alias chunked_auto) --------------------------
+# ---- union of sparsity cutoffs over several layouts ("chunked") --------------------------
 # FLOWFarm keeps one deficit cutoff per wind state (0.1 x the smallest deficit that still has a
 # nonzero derivative at the calibration layout); a pair is kept when its deficit >= cutoff. The
 # union of the patterns of several layouts is the pattern of the smallest cutoff over them.
@@ -223,6 +222,7 @@ function union_snapshot!(ss, farm_fd, x, tolerance)
     return nothing
 end
 
+# Test only (forces the dense fallback; see _test_threshold_scale in component.py).
 scale_thresholds!(ss, f) = (ss.deficit_thresholds .*= f; nothing)
 
 """Fraction of off-diagonal turbine pairs kept by the current cutoffs at layout x, over states with wind."""

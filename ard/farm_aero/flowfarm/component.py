@@ -44,8 +44,26 @@ _ARD_OPTIONS = (
     "union_snapshots",
     "union_seed",
     "min_spacing_D",
-    "reverse_cc_rule",
 )
+
+
+_OPTIONS_DOC = """
+    Options (``modeling_options["flowfarm"]``; defaults in parentheses):
+
+    - ``jacobian_method`` ("reverse"): "reverse" (per-state Enzyme reverse; needs Julia 1.11+) or
+      "chunked" (forward chunked ForwardDiff: dense below ``auto_dense_below`` turbines, else a
+      union-of-layouts sparse pattern self-checked against dense, with dense fallback).
+      Discontinuous models (JensenTopHat, LocalTIModelMaxTI) give unreliable gradients with either.
+    - ``opt_yaw`` (True): False drops the yaw partials; ``yaw_turbines`` must then stay 0.
+    - ``auto_dense_below`` (25): turbine count below which "chunked" uses the dense path.
+    - ``union_snapshots`` (8): layouts used to build the union sparsity cutoffs ("chunked" above
+      the threshold; 0 disables the union).
+    - ``union_seed`` (0): RNG seed of those layouts.
+    - ``min_spacing_D`` (3.0): minimum turbine spacing (rotor diameters) of those layouts.
+    - ``tolerance`` (1e-16): FLOWFarm sparsity tolerance.
+    - wake model keys (deficit, deflection, turbulence, superposition, ...): see
+      ``flowfarm_model.resolve_wake_model_inputs_for_flowfarm``.
+"""
 
 
 class FLOWFarmComponent:
@@ -54,17 +72,13 @@ class FLOWFarmComponent:
     sparse_struct = None
     # Test hook only (not a user option): scales the chunked-auto sparsity cutoffs to force the dense fallback.
     _test_threshold_scale = 1.0
+    # Gradient path, set in setup: "reverse", "dense", "auto" (union-sparse pending first gradient),
+    # "sparse" (union-sparse, self-checked) or None before setup.
+    _jac_mode = None
 
     def initialize(self):
         # This mixin is invoked explicitly by derived classes; no super() chain here.
         return
-
-    def _reverse_cc_rule(self):
-        """flowfarm.reverse_cc_rule: "auto" (default) or "off"."""
-        mode = self.options["modeling_options"].get("flowfarm", {}).get("reverse_cc_rule", "auto")
-        if mode not in ("auto", "off"):
-            raise ValueError(f"flowfarm.reverse_cc_rule must be 'auto' or 'off', got {mode!r}")
-        return mode == "auto"
 
     def _get_air_density(self, wind_resource):
         return float(wind_resource.get("air_density", 1.225))
@@ -386,30 +400,21 @@ class FLOWFarmComponent:
         model_set = self._build_wake_model_set(flowfarm_module, wake_model_options)
 
         x_init, y_init = self._initial_turbine_positions(model_options, rotor_diameter)
-        # flowfarm.jacobian_method: "reverse" (default; per-state Enzyme reverse, _reverse.jl,
-        # FLOWFarmBatchPower and FLOWFarmAEP; the AEP component sums the per-state rows),
-        # "chunked" (forward: dense below auto_dense_below turbines, else a union-of-layouts sparse
-        # pattern self-checked against dense with dense fallback; alias "chunked_auto"),
-        # "chunked_dense" (explicit dense chunked ForwardDiff, no sparsity pruning, _fastjac.jl),
-        # "chunked_sparse" (opt-in: color-seeded chunked ForwardDiff on FLOWFarm's
-        # sparse pattern, whose cutoffs are set when the pattern is built and can be off) or
-        # "di" (FLOWFarm's DifferentiationInterface sparse path). Discontinuous models
-        # (JensenTopHat, LocalTIModelMaxTI) give unreliable gradients with any method.
+        # flowfarm.jacobian_method: see _OPTIONS_DOC. Discontinuous models (JensenTopHat,
+        # LocalTIModelMaxTI) give unreliable gradients with any method.
         method = model_options.get("flowfarm", {}).get("jacobian_method", "reverse")
-        if method not in ("reverse", "chunked", "chunked_auto", "chunked_dense", "chunked_sparse", "di"):
-            raise ValueError(
-                "flowfarm.jacobian_method must be 'reverse', 'chunked' (auto; alias 'chunked_auto'), "
-                f"'chunked_dense', 'chunked_sparse' or 'di', got {method!r}"
-            )
+        if method not in ("reverse", "chunked"):
+            raise ValueError(f"flowfarm.jacobian_method must be 'reverse' or 'chunked', got {method!r}")
         ff_options = model_options.get("flowfarm", {})
-        if method in ("chunked", "chunked_auto"):
+        if method == "chunked":
             # dense for small farms; above the threshold a union-of-layouts sparse pattern that is
             # self-checked against the dense Jacobian at the first gradient (dense on failure)
             if self.N_turbines < int(ff_options.get("auto_dense_below", 25)):
-                method = "chunked_dense"
+                self._jac_mode = "dense"
             else:
-                method = "chunked_sparse"
-                self._auto_pending = True
+                self._jac_mode = "auto"
+        else:
+            self._jac_mode = "reverse"
         x0, farm = self._build_farm_structures(
             jl,
             flowfarm_module,
@@ -437,9 +442,9 @@ class FLOWFarmComponent:
         self.sparse_struct = None
 
         self._fastjac_cache = None
-        if method in ("chunked_dense", "chunked_sparse") and not jl.seval("isdefined(Main, :ArdFastJac)"):
+        if method == "chunked" and not jl.seval("isdefined(Main, :ArdFastJac)"):
             jl.seval(Path(__file__).with_name("_fastjac.jl").read_text())
-        if method == "reverse":
+        if self._jac_mode == "reverse":
             if not jl.seval("isdefined(Main, :ArdReverse)"):
                 jl.seval(Path(__file__).with_name("_reverse.jl").read_text())
             n_states = len(np.asarray(farm.constants.wind_resource.wind_speeds).ravel())
@@ -448,20 +453,40 @@ class FLOWFarmComponent:
             # the (identically zero) yaw deflection; yaw columns of state_gradients are then 0.
             self.sparse_struct = jl.ArdReverse.ReverseState(
                 farm, n_states, self.N_turbines, 3 * self.N_turbines, opt_yaw=self.opt_yaw,
-                cc_rule=self._reverse_cc_rule(),
             )
-            self._reverse = True
-        elif method == "chunked_dense":
+        elif self._jac_mode == "dense":
             n_states = len(np.asarray(farm.constants.wind_resource.wind_speeds).ravel())
             ndv = (3 if self.opt_yaw else 2) * self.N_turbines
             w = min(8, ndv)
             self.sparse_farm = self._build_dense_farm(w)
             self.sparse_struct = jl.ArdFastJac.DenseState(self.sparse_farm, n_states, self.N_turbines, ndv, w)
-            self._dense = True
-        elif method == "chunked_sparse":
-            # sparse struct is built lazily; take the state count from the wind resource
-            n_states = len(np.asarray(farm.constants.wind_resource.wind_speeds).ravel())
-            self._fastjac_cache = jl.ArdFastJac.FastCache(n_states)
+
+    def _yaw_chain(self, g):
+        """Julia gradient columns d/d(yaw_rad) -> d/d(yaw_deg) (yaw_turbines input is in degrees)."""
+        return g[..., 2 * self.N_turbines : 3 * self.N_turbines] * np.deg2rad(1.0)
+
+    def _declare_aep_partials(self, outputs, fd_xy):
+        """Declare exact partials of ``outputs`` wrt x/y(/yaw) and set the FD check steps."""
+        for of in outputs:
+            self.declare_partials(of, "x_turbines", method="exact")
+            self.declare_partials(of, "y_turbines", method="exact")
+            if self.opt_yaw:
+                self.declare_partials(of, "yaw_turbines", method="exact")
+        if self.opt_yaw:
+            # yaw_turbines is in degrees; use a 0.01° step (not position-scale meters)
+            self.set_check_partial_options("yaw_turbines", method="fd", step=0.01)
+        if fd_xy:
+            # x/y_turbines are in meters, spanning O(1e3). A large default FD step
+            # (e.g. 1-10 m) can push a downwind turbine's effective wind speed
+            # across a power-curve kink (cut-in, rated speed, cut-out), producing
+            # a secant across the discontinuity instead of the true local
+            # derivative -- this looks like a large partials error but is really
+            # FD truncation noise unrelated to the analytic method's accuracy.
+            # 0.01 m keeps the step well within a single power-curve segment for
+            # essentially all wind states while staying far above float64
+            # cancellation noise for O(1e4-1e6) W power values.
+            self.set_check_partial_options("x_turbines", method="fd", step=0.01)
+            self.set_check_partial_options("y_turbines", method="fd", step=0.01)
 
     def _build_design_vector(self, inputs):
         x_turbines = np.asarray(inputs["x_turbines"], dtype=float)
@@ -511,7 +536,6 @@ class FLOWFarmComponent:
         """chunked (auto) above the dense threshold: union cutoffs, self-check, dense fallback."""
         import warnings
 
-        self._auto_pending = False
         opts = self.options["modeling_options"].get("flowfarm", {})
         K = int(opts.get("union_snapshots", 8))
         N = self.N_turbines
@@ -553,9 +577,10 @@ class FLOWFarmComponent:
             self._fastjac_cache = None
             self.sparse_farm = dense_farm
             self.sparse_struct = dense
-            self._dense = True
+            self._jac_mode = "dense"
             self.auto_info["fallback"] = True
         else:
+            self._jac_mode = "sparse"
             self.auto_info["fallback"] = False
 
     def _evaluate_sparse(self, x_eval_np):
@@ -570,35 +595,24 @@ class FLOWFarmComponent:
             jl = ensure_flowfarm_loaded()
             self._jl = jl
         self._check_yaw(x_eval_np)
-        if getattr(self, "_reverse", False):
+        if self._jac_mode == "reverse":
             # ReverseState takes the full [x; y; yaw] vector (yaw columns 0 when opt_yaw is False).
             aep_val, grad_val = getattr(jl.ArdReverse, "gradient!")(
                 self.sparse_farm, to_julia_vector_float64(jl, x_eval_np), self.sparse_struct
             )
-        elif getattr(self, "_auto_pending", False):
+        elif self._jac_mode == "auto":
             self._finish_auto_setup(jl)
             return self._evaluate_sparse(x_eval_np)
-        elif getattr(self, "_dense", False):
+        elif self._jac_mode == "dense":
             x_dense = x_eval_np if self.opt_yaw else x_eval_np[: 2 * self.N_turbines]
             aep_val, grad_val = getattr(jl.ArdFastJac, "dense_gradient!")(
                 self.sparse_farm, to_julia_vector_float64(jl, x_dense), self.sparse_struct
             )
         else:
-            if self.sparse_struct is None:
-                self.sparse_farm, self.sparse_struct = self._build_sparse()
             x_sparse = x_eval_np if self.opt_yaw else x_eval_np[: 2 * self.N_turbines]
-            x_eval = to_julia_vector_float64(jl, x_sparse)
-            if getattr(self, "_fastjac_cache", None) is not None:
-                aep_val, grad_val = getattr(jl.ArdFastJac, "gradient!")(
-                    self.sparse_farm, x_eval, self.sparse_struct, self._fastjac_cache
-                )
-            else:
-                calculate_grad_bang = getattr(self.flowfarm_module, "calculate_aep_gradient!")
-                aep_val, grad_val = calculate_grad_bang(
-                    self.sparse_farm,
-                    x_eval,
-                    self.sparse_struct,
-                )
+            aep_val, grad_val = getattr(jl.ArdFastJac, "gradient!")(
+                self.sparse_farm, to_julia_vector_float64(jl, x_sparse), self.sparse_struct, self._fastjac_cache
+            )
 
         self._cached_sparse_x = x_eval_np.copy()
         self._cached_sparse_aep = float(np.asarray(aep_val).ravel()[0])
@@ -636,34 +650,13 @@ class FLOWFarmComponent:
         partials["AEP_farm", "x_turbines"] = grad[: self.N_turbines]
         partials["AEP_farm", "y_turbines"] = grad[self.N_turbines : 2 * self.N_turbines]
         if self.opt_yaw:
-            # Julia gradient is d/d(yaw_rad); yaw_turbines input is in degrees → chain rule factor
-            partials["AEP_farm", "yaw_turbines"] = (
-                grad[2 * self.N_turbines : 3 * self.N_turbines] * np.deg2rad(1.0)
-            )
+            partials["AEP_farm", "yaw_turbines"] = self._yaw_chain(grad)
 
 
 class FLOWFarmAEP(templates.FarmAEPTemplate, FLOWFarmComponent):
     """FLOWFarm farm AEP (Wh/yr); yaw_turbines in degrees.
 
-    Options (``modeling_options["flowfarm"]``; defaults in parentheses):
-
-    - ``jacobian_method`` ("reverse"): "reverse" (per-state Enzyme reverse; needs Julia 1.11+),
-      "chunked" (auto: dense chunked ForwardDiff below ``auto_dense_below`` turbines, else a
-      union-of-layouts sparse pattern self-checked against dense; alias "chunked_auto"),
-      "chunked_dense", "chunked_sparse" (opt-in; cutoffs fixed at the start layout) or "di"
-      (FLOWFarm's DifferentiationInterface sparse path).
-    - ``opt_yaw`` (True): False drops the yaw partials; ``yaw_turbines`` must then stay 0.
-    - ``reverse_cc_rule`` ("auto"): "reverse" with a CumulativeCurl deficit model uses FLOWFarm's
-      hand-written CumulativeCurlAD rule (FLOWFarmEnzymeExt, ~1.4-2x faster) when the extension is
-      loaded, else plain Enzyme; "off" always uses plain Enzyme.
-    - ``auto_dense_below`` (25): turbine count below which "chunked" uses the dense path.
-    - ``union_snapshots`` (8): layouts used to build the union sparsity cutoffs ("chunked" above
-      the threshold; 0 disables the union).
-    - ``union_seed`` (0): RNG seed of those layouts.
-    - ``min_spacing_D`` (3.0): minimum turbine spacing (rotor diameters) of those layouts.
-    - ``tolerance`` (1e-16): FLOWFarm sparsity tolerance.
-    - wake model keys (deficit, deflection, turbulence, superposition, ...): see
-      ``flowfarm_model.resolve_wake_model_inputs_for_flowfarm``.
+    See ``_OPTIONS_DOC`` below the class.
 
     Partials of AEP_farm wrt x_turbines, y_turbines (m) and, if opt_yaw, yaw_turbines (deg).
     """
@@ -677,12 +670,7 @@ class FLOWFarmAEP(templates.FarmAEPTemplate, FLOWFarmComponent):
         FLOWFarmComponent.setup(self)
 
     def setup_partials(self):
-        self.declare_partials("AEP_farm", "x_turbines", method="exact")
-        self.declare_partials("AEP_farm", "y_turbines", method="exact")
-        if self.opt_yaw:
-            self.declare_partials("AEP_farm", "yaw_turbines", method="exact")
-            # yaw_turbines is in degrees; use a 0.01° step (not position-scale meters)
-            self.set_check_partial_options("yaw_turbines", method="fd", step=0.01)
+        self._declare_aep_partials(["AEP_farm"], fd_xy=False)
 
     def compute(self, inputs, outputs):
         FLOWFarmComponent._compute_aep(self, inputs, outputs)
@@ -694,25 +682,7 @@ class FLOWFarmAEP(templates.FarmAEPTemplate, FLOWFarmComponent):
 class FLOWFarmBatchPower(templates.BatchFarmPowerTemplate, FLOWFarmComponent):
     """FLOWFarm per-state farm power (W) and AEP_farm (Wh/yr); yaw_turbines in degrees.
 
-    Options (``modeling_options["flowfarm"]``; defaults in parentheses):
-
-    - ``jacobian_method`` ("reverse"): "reverse" (per-state Enzyme reverse; needs Julia 1.11+),
-      "chunked" (auto: dense chunked ForwardDiff below ``auto_dense_below`` turbines, else a
-      union-of-layouts sparse pattern self-checked against dense; alias "chunked_auto"),
-      "chunked_dense", "chunked_sparse" (opt-in; cutoffs fixed at the start layout) or "di"
-      (FLOWFarm's DifferentiationInterface sparse path).
-    - ``opt_yaw`` (True): False drops the yaw partials; ``yaw_turbines`` must then stay 0.
-    - ``reverse_cc_rule`` ("auto"): "reverse" with a CumulativeCurl deficit model uses FLOWFarm's
-      hand-written CumulativeCurlAD rule (FLOWFarmEnzymeExt, ~1.4-2x faster) when the extension is
-      loaded, else plain Enzyme; "off" always uses plain Enzyme.
-    - ``auto_dense_below`` (25): turbine count below which "chunked" uses the dense path.
-    - ``union_snapshots`` (8): layouts used to build the union sparsity cutoffs ("chunked" above
-      the threshold; 0 disables the union).
-    - ``union_seed`` (0): RNG seed of those layouts.
-    - ``min_spacing_D`` (3.0): minimum turbine spacing (rotor diameters) of those layouts.
-    - ``tolerance`` (1e-16): FLOWFarm sparsity tolerance.
-    - wake model keys (deficit, deflection, turbulence, superposition, ...): see
-      ``flowfarm_model.resolve_wake_model_inputs_for_flowfarm``.
+    See ``_OPTIONS_DOC`` below the class.
 
     Partials of power_farm and AEP_farm wrt x_turbines, y_turbines (m) and, if opt_yaw, yaw_turbines (deg).
     """
@@ -727,28 +697,9 @@ class FLOWFarmBatchPower(templates.BatchFarmPowerTemplate, FLOWFarmComponent):
 
     def setup_partials(self):
         # State power sensitivities are provided via sparse_struct.state_gradients.
-        self.declare_partials("power_farm", "x_turbines", method="exact")
-        self.declare_partials("power_farm", "y_turbines", method="exact")
         # AEP_farm = sum(state_powers) is also an output; undeclared, its partials
         # would be treated as zero (silently zero d AEP_farm / d layout).
-        self.declare_partials("AEP_farm", "x_turbines", method="exact")
-        self.declare_partials("AEP_farm", "y_turbines", method="exact")
-        if self.opt_yaw:
-            self.declare_partials("power_farm", "yaw_turbines", method="exact")
-            self.declare_partials("AEP_farm", "yaw_turbines", method="exact")
-            # yaw_turbines is in degrees; use a 0.01° step (not position-scale meters)
-            self.set_check_partial_options("yaw_turbines", method="fd", step=0.01)
-        # x/y_turbines are in meters, spanning O(1e3). A large default FD step
-        # (e.g. 1-10 m) can push a downwind turbine's effective wind speed
-        # across a power-curve kink (cut-in, rated speed, cut-out), producing
-        # a secant across the discontinuity instead of the true local
-        # derivative -- this looks like a large partials error but is really
-        # FD truncation noise unrelated to the analytic method's accuracy.
-        # 0.01 m keeps the step well within a single power-curve segment for
-        # essentially all wind states while staying far above float64
-        # cancellation noise for O(1e4-1e6) W power values.
-        self.set_check_partial_options("x_turbines", method="fd", step=0.01)
-        self.set_check_partial_options("y_turbines", method="fd", step=0.01)
+        self._declare_aep_partials(["power_farm", "AEP_farm"], fd_xy=True)
 
     def _get_state_scale(self):
         """Per-state scale factor used by FLOWFarm: hours_per_year * prob[i].
@@ -813,15 +764,14 @@ class FLOWFarmBatchPower(templates.BatchFarmPowerTemplate, FLOWFarmComponent):
         ]
         if self.opt_yaw:
             # Julia gradient is d/d(yaw_rad); yaw_turbines input is in degrees → chain rule factor
-            partials["power_farm", "yaw_turbines"] = (
-                state_gradients[:, 2 * self.N_turbines : 3 * self.N_turbines] * np.deg2rad(1.0)
-            )
-        # AEP_farm = sum_i state_powers[i] (Wh/year), so its gradient is the column
-        # sum of the unscaled state_gradients.
-        aep_grad = np.asarray(self.sparse_struct.state_gradients).sum(axis=0)
+            partials["power_farm", "yaw_turbines"] = self._yaw_chain(state_gradients)
+        # AEP_farm = sum_i state_powers[i] (Wh/year): its gradient is the cached unscaled column sum.
+        aep_grad = self._cached_sparse_grad
         partials["AEP_farm", "x_turbines"] = aep_grad[: self.N_turbines]
         partials["AEP_farm", "y_turbines"] = aep_grad[self.N_turbines : 2 * self.N_turbines]
         if self.opt_yaw:
-            partials["AEP_farm", "yaw_turbines"] = (
-                aep_grad[2 * self.N_turbines : 3 * self.N_turbines] * np.deg2rad(1.0)
-            )
+            partials["AEP_farm", "yaw_turbines"] = self._yaw_chain(aep_grad)
+
+
+for _cls in (FLOWFarmAEP, FLOWFarmBatchPower):
+    _cls.__doc__ = _cls.__doc__.replace("See ``_OPTIONS_DOC`` below the class.\n", _OPTIONS_DOC)
