@@ -77,10 +77,16 @@ class TestBuildDesignVector:
 # ---------------------------------------------------------------------------
 
 
+def _grad_fn(comp):
+    """The mocked Julia gradient entry point used by the dense path."""
+    return getattr(comp._jl.ArdFastJac, "dense_gradient!")
+
+
 def _make_component_with_mock_julia(n_turbines=3):
     """Return a FLOWFarmComponent wired up with mock Julia objects."""
     comp = FLOWFarmComponent.__new__(FLOWFarmComponent)
     comp.N_turbines = n_turbines
+    comp._jac_mode = "dense"
 
     mock_jl = MagicMock(name="jl_main")
     comp._jl = mock_jl
@@ -90,7 +96,7 @@ def _make_component_with_mock_julia(n_turbines=3):
     comp.farm = MagicMock(name="farm")
 
     # Set up the Julia function return values
-    grad_fn = getattr(comp.flowfarm_module, "calculate_aep_gradient!")
+    grad_fn = _grad_fn(comp)
     grad_fn.return_value = (100.0, np.array([0.1] * (3 * n_turbines)))
 
     aep_fn = getattr(comp.flowfarm_module, "calculate_aep!")
@@ -103,7 +109,7 @@ class TestEvaluateSparseCache:
 
     def test_caches_result_on_same_x(self):
         comp = _make_component_with_mock_julia()
-        grad_fn = getattr(comp.flowfarm_module, "calculate_aep_gradient!")
+        grad_fn = _grad_fn(comp)
 
         x = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0, 0.0, 0.0])
         comp._evaluate_sparse(x)
@@ -113,7 +119,7 @@ class TestEvaluateSparseCache:
 
     def test_reruns_on_different_x(self):
         comp = _make_component_with_mock_julia()
-        grad_fn = getattr(comp.flowfarm_module, "calculate_aep_gradient!")
+        grad_fn = _grad_fn(comp)
 
         x1 = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0, 0.0, 0.0])
         x2 = np.array([9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 0.0, 0.0, 0.0])
@@ -125,7 +131,7 @@ class TestEvaluateSparseCache:
     def test_stores_aep_and_grad_after_evaluation(self):
         n = 3
         comp = _make_component_with_mock_julia(n_turbines=n)
-        grad_fn = getattr(comp.flowfarm_module, "calculate_aep_gradient!")
+        grad_fn = _grad_fn(comp)
         mock_grad = np.arange(3 * n, dtype=float)
         grad_fn.return_value = (42.0, mock_grad)
 
@@ -180,7 +186,7 @@ class TestComputeAEPPartials:
         n = 4
         comp = _make_component_with_mock_julia(n_turbines=n)
         grad = np.arange(3 * n, dtype=float)
-        getattr(comp.flowfarm_module, "calculate_aep_gradient!").return_value = (
+        _grad_fn(comp).return_value = (
             1.0,
             grad,
         )
