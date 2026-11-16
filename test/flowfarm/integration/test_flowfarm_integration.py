@@ -242,12 +242,12 @@ def _aep_problem(method=None, opt_yaw=True, wake=None, extra=None):
 @pytest.mark.julia
 class TestFLOWFarmAEPJacobianMethod:
 
-    @pytest.mark.parametrize("method,tol", [("reverse", 1e-5), ("chunked_dense", 1e-5)])
+    @pytest.mark.parametrize("method,tol", [("reverse", 1e-5), ("chunked", 1e-5)])
     @pytest.mark.parametrize("opt_yaw", [True, False])
     def test_gradient_matches_central_fd(self, method, tol, opt_yaw):
         # Reverse and dense chunked ForwardDiff are exact to FD noise (no pruning).
         prob, comp = _aep_problem(method, opt_yaw)
-        assert bool(getattr(comp, "_reverse", False)) == (method == "reverse")
+        assert comp._jac_mode == ("reverse" if method == "reverse" else "dense")
         wrt = ["aepFLOWFarm.x_turbines", "aepFLOWFarm.y_turbines"]
         if opt_yaw:
             wrt.append("aepFLOWFarm.yaw_turbines")
@@ -274,8 +274,8 @@ class TestFLOWFarmAEPJacobianMethod:
     def test_dense_chunked_matches_reverse(self):
         # Same layout, both methods: dense chunked must agree with reverse to roundoff.
         pr, _ = _aep_problem("reverse")
-        pc, comp = _aep_problem("chunked_dense")
-        assert getattr(comp, "_dense", False)
+        pc, comp = _aep_problem("chunked")
+        assert comp._jac_mode == "dense"
         wrt = [f"aepFLOWFarm.{v}_turbines" for v in ("x", "y", "yaw")]
         tr = pr.compute_totals(of=["aepFLOWFarm.AEP_farm"], wrt=wrt)
         tc = pc.compute_totals(of=["aepFLOWFarm.AEP_farm"], wrt=wrt)
@@ -289,16 +289,15 @@ class TestFLOWFarmAEPJacobianMethod:
         t = prob.compute_totals(of=["aepFLOWFarm.AEP_farm"], wrt=wrt)
         return np.concatenate([t["aepFLOWFarm.AEP_farm", w].ravel() for w in wrt])
 
-    @pytest.mark.parametrize("alias", ["chunked", "chunked_auto"])
     @pytest.mark.parametrize("wake", ["GaussYawVariableSpread", "CumulativeCurl"])
     @pytest.mark.parametrize("below", [25, 1])  # 25: dense (N=9 < 25); 1: union-sparse path
-    def test_chunked_auto_matches_reverse(self, alias, wake, below):
+    def test_chunked_auto_matches_reverse(self, wake, below):
         pr, _ = _aep_problem("reverse", wake=wake)
-        pa, comp = _aep_problem(alias, wake=wake, extra={"auto_dense_below": below})
+        pa, comp = _aep_problem("chunked", wake=wake, extra={"auto_dense_below": below})
         ga = self._aep_grad(pa)
         gr = self._aep_grad(pr)
         assert np.abs(ga - gr).max() <= 1e-12 * np.abs(gr).max()
-        assert getattr(comp, "_dense", False) == (below == 25)
+        assert (comp._jac_mode == "dense") == (below == 25)
         if below == 1:
             assert comp.auto_info["fallback"] is False
             assert comp.auto_info["density_union"] >= comp.auto_info["density_single"] - 1e-12
@@ -315,17 +314,13 @@ class TestFLOWFarmAEPJacobianMethod:
                 extra={"auto_dense_below": 1},
             )
             ga = self._aep_grad(pa)
-        assert comp._dense and comp.auto_info["fallback"] and comp.auto_info["selfcheck_bad_pairs"] > 0
+        assert comp._jac_mode == "dense" and comp.auto_info["fallback"] and comp.auto_info["selfcheck_bad_pairs"] > 0
         gr = self._aep_grad(pr)
         assert np.abs(ga - gr).max() <= 1e-12 * np.abs(gr).max()
 
-    def test_chunked_sparse_is_opt_in(self):
-        _, comp = _aep_problem("chunked_sparse")
-        assert comp._fastjac_cache is not None and not getattr(comp, "_dense", False)
-
     def test_default_is_reverse(self):
         _, comp = _aep_problem(None)
-        assert comp._reverse is True
+        assert comp._jac_mode == "reverse"
 
     def test_ard_options_do_not_warn_as_unknown_wake_options(self):
         import warnings
@@ -333,34 +328,8 @@ class TestFLOWFarmAEPJacobianMethod:
         extra = {"auto_dense_below": 3, "union_snapshots": 2, "union_seed": 1, "min_spacing_D": 3.0}
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            _aep_problem("chunked_dense", extra=extra)
+            _aep_problem("chunked", extra=extra)
         assert not [x for x in w if "unknown wake model options" in str(x.message)]
-
-    def test_di_matches_reverse(self):
-        # legacy DifferentiationInterface path (calculate_aep_gradient!) smoke test; its sparsity
-        # pattern is pruned at the start layout (~4% here), so only a loose agreement is expected
-        pr, _ = _aep_problem("reverse")
-        pd, _ = _aep_problem("di")
-        gr, gd = self._aep_grad(pr), self._aep_grad(pd)
-        assert np.isfinite(gd).all() and np.abs(gd - gr).max() <= 0.1 * np.abs(gr).max()
-
-    @pytest.mark.parametrize("opt_yaw", [True, False])
-    def test_reverse_cc_rule_matches_plain_enzyme(self, opt_yaw):
-        # CumulativeCurlAD hand rule (FLOWFarmEnzymeExt) vs plain Enzyme reverse
-        pa, ca = _aep_problem("reverse", opt_yaw=opt_yaw, wake="CumulativeCurl")
-        po, co = _aep_problem("reverse", opt_yaw=opt_yaw, wake="CumulativeCurl", extra={"reverse_cc_rule": "off"})
-        used = lambda c: "CumulativeCurlAD" in str(c._jl.typeof(c.sparse_struct.case.model_set.wake_deficit_model))
-        assert used(ca) and not used(co)
-        ga, go = self._aep_grad(pa), self._aep_grad(po)
-        assert np.abs(ga - go).max() <= 1e-12 * np.abs(go).max()
-
-    def test_reverse_cc_rule_not_used_for_other_wake_models(self):
-        _, c = _aep_problem("reverse", wake="GaussYawVariableSpread")
-        assert "CumulativeCurlAD" not in str(c._jl.typeof(c.sparse_struct.case.model_set.wake_deficit_model))
-
-    def test_invalid_reverse_cc_rule_raises(self):
-        with pytest.raises(ValueError, match="reverse_cc_rule"):
-            _aep_problem("reverse", extra={"reverse_cc_rule": "maybe"})
 
     def test_invalid_method_raises(self):
         with pytest.raises(ValueError, match="jacobian_method"):
