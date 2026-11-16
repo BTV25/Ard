@@ -74,6 +74,8 @@ class FLOWFarmComponent:
     _test_threshold_scale = 1.0
     # Gradient path, set in setup: "reverse", "dense", "auto" (union-sparse pending first gradient),
     # "sparse" (union-sparse, self-checked) or None before setup.
+    # User option flowfarm.jacobian_method -> _jac_mode: "reverse" -> "reverse"; "chunked" -> "dense" (N_turbines <
+    # auto_dense_below) or "auto"; "auto" becomes "sparse" (pattern accepted) or "dense" (self-check failed) at the first gradient.
     _jac_mode = None
 
     def initialize(self):
@@ -348,6 +350,25 @@ class FLOWFarmComponent:
         y_rot = s * x_init + c * y_init
         return x_rot, y_rot
 
+    def _select_jac_mode(self, model_options):
+        """Set ``self._jac_mode`` from ``flowfarm.jacobian_method`` and return that method ("reverse" or "chunked")."""
+        # flowfarm.jacobian_method: see _OPTIONS_DOC. Discontinuous models (JensenTopHat,
+        # LocalTIModelMaxTI) give unreliable gradients with any method.
+        ff_options = model_options.get("flowfarm", {})
+        method = ff_options.get("jacobian_method", "reverse")
+        if method not in ("reverse", "chunked"):
+            raise ValueError(f"flowfarm.jacobian_method must be 'reverse' or 'chunked', got {method!r}")
+        if method == "chunked":
+            # dense for small farms; above the threshold a union-of-layouts sparse pattern that is
+            # self-checked against the dense Jacobian at the first gradient (dense on failure)
+            if self.N_turbines < int(ff_options.get("auto_dense_below", 25)):
+                self._jac_mode = "dense"
+            else:
+                self._jac_mode = "auto"
+        else:
+            self._jac_mode = "reverse"
+        return method
+
     def setup(self):
         jl = ensure_flowfarm_loaded()
         self._jl = jl
@@ -400,21 +421,7 @@ class FLOWFarmComponent:
         model_set = self._build_wake_model_set(flowfarm_module, wake_model_options)
 
         x_init, y_init = self._initial_turbine_positions(model_options, rotor_diameter)
-        # flowfarm.jacobian_method: see _OPTIONS_DOC. Discontinuous models (JensenTopHat,
-        # LocalTIModelMaxTI) give unreliable gradients with any method.
-        method = model_options.get("flowfarm", {}).get("jacobian_method", "reverse")
-        if method not in ("reverse", "chunked"):
-            raise ValueError(f"flowfarm.jacobian_method must be 'reverse' or 'chunked', got {method!r}")
-        ff_options = model_options.get("flowfarm", {})
-        if method == "chunked":
-            # dense for small farms; above the threshold a union-of-layouts sparse pattern that is
-            # self-checked against the dense Jacobian at the first gradient (dense on failure)
-            if self.N_turbines < int(ff_options.get("auto_dense_below", 25)):
-                self._jac_mode = "dense"
-            else:
-                self._jac_mode = "auto"
-        else:
-            self._jac_mode = "reverse"
+        method = self._select_jac_mode(model_options)
         x0, farm = self._build_farm_structures(
             jl,
             flowfarm_module,
