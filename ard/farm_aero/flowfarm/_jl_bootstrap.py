@@ -1,5 +1,6 @@
 # ard/farm_aero/flowfarm/_jl_bootstrap.py
 from __future__ import annotations
+import os
 import pathlib
 
 _jl_runtime = None
@@ -12,6 +13,9 @@ def get_julia_runtime():
     if _jl_runtime is not None:
         return _jl_runtime
 
+    # must be set before juliacall starts Julia; without it, multithreaded Julia under
+    # JuliaCall can segfault (Bus error) or hang. An explicit user setting still wins.
+    os.environ.setdefault("PYTHON_JULIACALL_HANDLE_SIGNALS", "yes")
     from juliacall import Main as jl_main
     from juliacall import Pkg as jl_pkg
 
